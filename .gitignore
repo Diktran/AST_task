@@ -1,5 +1,5 @@
 # СЕКРЕТНЫЕ ФАЙЛЫ (НИКОГДА НЕ КОММИТИТЬ!)
-credentials.json
+service_account.json
 *.key
 secret.key
 .env
