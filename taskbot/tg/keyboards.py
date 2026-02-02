@@ -74,3 +74,17 @@ def main_menu_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
         one_time_keyboard=False,
         selective=False,
     )
+
+def period_filter_keyboard(mode: str):
+    """
+    Фильтр по сроку (due date).
+    mode: "overdue" или "done"
+    callback: period:<mode>:day/week/month/other
+    """
+    kb = InlineKeyboardBuilder()
+    kb.button(text="День", callback_data=f"period:{mode}:day")
+    kb.button(text="Неделя", callback_data=f"period:{mode}:week")
+    kb.button(text="Месяц", callback_data=f"period:{mode}:month")
+    kb.button(text="Другое", callback_data=f"period:{mode}:other")
+    kb.adjust(2)
+    return kb.as_markup()

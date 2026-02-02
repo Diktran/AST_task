@@ -10,7 +10,7 @@
 # - DONE для личных и общих задач
 
 from __future__ import annotations
-
+from datetime import date, timedelta
 from typing import Optional, Tuple, List
 import uuid
 
@@ -19,14 +19,14 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-
-from taskbot.tg.fsm import NewTaskFSM
+from taskbot.tg.fsm import NewTaskFSM, TasksFilterFSM
 from taskbot.tg.keyboards import (
     assignee_keyboard,
     due_date_keyboard,
     done_personal_keyboard,
     done_common_keyboard,
     main_menu_keyboard,
+    period_filter_keyboard,
 )
 
 from taskbot.sheets.users import (
@@ -128,6 +128,41 @@ def _parse_unregister_target(arg: str) -> Tuple[Optional[int], Optional[str]]:
     if arg.isdigit():
         return int(arg), None
     return None, arg
+
+def _period_range(period: str) -> tuple[str, str]:
+    """
+    Возвращает (start_iso, end_iso) по пресету.
+    Считаем от today, но фильтруем ПО DUE ДАТЕ.
+    overdue: будем показывать задачи, у которых due попадает в этот диапазон.
+    done: аналогично.
+    """
+    today = date.today()
+
+    if period == "day":
+        start = today - timedelta(days=1)
+        end = today
+    elif period == "week":
+        start = today - timedelta(days=7)
+        end = today
+    elif period == "month":
+        start = today - timedelta(days=30)
+        end = today
+    else:
+        # fallback, но вообще сюда не должны попасть
+        start = today - timedelta(days=7)
+        end = today
+
+    return start.isoformat(), end.isoformat()
+
+
+def _in_due_range(due_iso: str, start_iso: str, end_iso: str) -> bool:
+    """
+    Проверка что due находится в диапазоне включительно.
+    """
+    if not due_iso:
+        return False
+    return start_iso <= due_iso <= end_iso
+
 
 
 # ---------- commands ----------
@@ -261,13 +296,14 @@ async def btn_my(message: Message):
 
 
 @router.message(F.text == "⏰ Просроченные")
-async def btn_overdue(message: Message):
-    await cmd_overdue(message)
+async def btn_overdue(message: Message, state: FSMContext):
+    await cmd_overdue(message, state)
 
 
 @router.message(F.text == "✅ Выполненные")
-async def btn_done(message: Message):
-    await cmd_done(message)
+async def btn_done(message: Message, state: FSMContext):
+    await cmd_done(message, state)
+
 
 
 @router.message(F.text == "📦 Все")
@@ -457,6 +493,153 @@ async def show_tasks(message: Message, my_sheet_name: str, mode: str):
             await message.answer(f"Отметить выполненной задачу [{t.task_id}]?", reply_markup=done_personal_keyboard(my_sheet_name, t.task_id))
 
 
+async def show_tasks_filtered(message: Message, my_sheet_name: str, mode: str, start_iso: str, end_iso: str):
+    """
+    Показываем задачи по фильтру периода (ПО DUE ДАТЕ).
+    mode: overdue или done
+    start_iso/end_iso: включительно
+    """
+    personal = await tasks_list(my_sheet_name)
+
+    if mode == "overdue":
+        personal = [
+            t for t in personal
+            if t.status != STATUS_DONE
+            and t.due_str
+            and is_overdue(t.due_str)                 # просрочено
+            and _in_due_range(t.due_str, start_iso, end_iso)  # и в диапазоне по due
+        ]
+    elif mode == "done":
+        personal = [
+            t for t in personal
+            if t.status == STATUS_DONE
+            and t.due_str
+            and _in_due_range(t.due_str, start_iso, end_iso)
+        ]
+    else:
+        await send_with_menu(message, "Неизвестный режим фильтра.")
+        return
+
+    # общие задачи тоже фильтруем по due
+    common = await common_tasks_for_user(my_sheet_name, mode)
+    common = [t for t in common if t.due_str and _in_due_range(t.due_str, start_iso, end_iso)]
+
+    combined: List[Tuple[TaskRow, bool]] = []
+    combined += [(t, False) for t in personal]
+    combined += [(t, True) for t in common]
+
+    if not combined:
+        await send_with_menu(message, f"Нет задач за период {start_iso} — {end_iso}.")
+        return
+
+    def sort_key(item: Tuple[TaskRow, bool]):
+        t, _ = item
+        due_val = t.due_str or "9999-12-31"
+        return due_val
+
+    combined.sort(key=sort_key)
+
+    lines = [
+        f"Период по сроку: {start_iso} — {end_iso}\n"
+    ] + [
+        format_task_line(t.task_id, t.task, t.from_name, t.due_str, t.status, is_common=is_common)
+        for (t, is_common) in combined
+    ]
+
+    for part in chunk_text(lines):
+        await send_with_menu(message, part)
+
+    # DONE-кнопки показываем только для overdue (чтобы можно было быстро закрывать)
+    if mode == "overdue":
+        for (t, is_common) in combined:
+            if t.status == STATUS_DONE:
+                continue
+            if is_common:
+                await message.answer(f"Отметить выполненной ОБЩУЮ задачу [{t.task_id}]?", reply_markup=done_common_keyboard(t.task_id))
+            else:
+                await message.answer(f"Отметить выполненной задачу [{t.task_id}]?", reply_markup=done_personal_keyboard(my_sheet_name, t.task_id))
+
+
+@router.callback_query(TasksFilterFSM.choosing_period, F.data.startswith("period:"))
+async def cb_choose_period(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+
+    _, mode, period = callback.data.split(":", 2)
+
+    data = await state.get_data()
+    sheet = data.get("filter_sheet")
+
+    if not sheet:
+        await callback.message.answer("Ошибка: не найден пользователь. Открой /done или /overdue заново.")
+        await state.clear()
+        await callback.answer()
+        return
+
+    if period == "other":
+        await state.update_data(filter_mode=mode)
+        await state.set_state(TasksFilterFSM.entering_start)
+        await callback.message.answer("Введи дату НАЧАЛА (например 2026-02-01 или 01.02.2026):")
+        await callback.answer()
+        return
+
+    start_iso, end_iso = _period_range(period)
+
+    await show_tasks_filtered(callback.message, sheet, mode, start_iso, end_iso)
+
+    await state.clear()
+    await callback.answer()
+
+
+@router.message(TasksFilterFSM.entering_start)
+async def filter_enter_start(message: Message, state: FSMContext):
+    if await deny_if_not_allowed(message):
+        return
+
+    raw = (message.text or "").strip()
+    try:
+        start_iso = normalize_due_date(raw)
+    except Exception:
+        await send_with_menu(message, "Не понял дату начала. Пример: 2026-02-01 или 01.02.2026.")
+        return
+
+    await state.update_data(filter_start=start_iso)
+    await state.set_state(TasksFilterFSM.entering_end)
+
+    await send_with_menu(message, "Теперь введи дату КОНЦА (например 2026-02-10 или 10.02.2026):")
+
+
+@router.message(TasksFilterFSM.entering_end)
+async def filter_enter_end(message: Message, state: FSMContext):
+    if await deny_if_not_allowed(message):
+        return
+
+    data = await state.get_data()
+    sheet = data.get("filter_sheet")
+    mode = data.get("filter_mode")
+    start_iso = data.get("filter_start")
+
+    raw = (message.text or "").strip()
+    try:
+        end_iso = normalize_due_date(raw)
+    except Exception:
+        await send_with_menu(message, "Не понял дату конца. Пример: 2026-02-10 или 10.02.2026.")
+        return
+
+    if not sheet or not mode or not start_iso:
+        await send_with_menu(message, "Ошибка состояния фильтра. Открой /done или /overdue заново.")
+        await state.clear()
+        return
+
+    if end_iso < start_iso:
+        await send_with_menu(message, f"Дата конца меньше даты начала. Начало: {start_iso}, конец: {end_iso}. Введи конец ещё раз.")
+        return
+
+    await show_tasks_filtered(message, sheet, mode, start_iso, end_iso)
+
+    await state.clear()
+
+
 @router.message(Command("my"))
 async def cmd_my(message: Message):
     if await deny_if_not_allowed(message):
@@ -471,9 +654,8 @@ async def cmd_my(message: Message):
 
     await show_tasks(message, my_sheet, "my")
 
-
 @router.message(Command("overdue"))
-async def cmd_overdue(message: Message):
+async def cmd_overdue(message: Message, state: FSMContext):
     if await deny_if_not_allowed(message):
         return
 
@@ -481,14 +663,21 @@ async def cmd_overdue(message: Message):
     my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
 
     if not my_sheet:
-        await message.answer("Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
+        await send_with_menu(message, "Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
         return
 
-    await show_tasks(message, my_sheet, "overdue")
+    # сохраняем контекст фильтра в FSM
+    await state.update_data(filter_mode="overdue", filter_sheet=my_sheet)
+    await state.set_state(TasksFilterFSM.choosing_period)
+
+    await message.answer(
+        "Выбери период по сроку задачи (считаем от даты СРОКА):",
+        reply_markup=period_filter_keyboard("overdue"),
+    )
 
 
 @router.message(Command("done"))
-async def cmd_done(message: Message):
+async def cmd_done(message: Message, state: FSMContext):
     if await deny_if_not_allowed(message):
         return
 
@@ -496,10 +685,17 @@ async def cmd_done(message: Message):
     my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
 
     if not my_sheet:
-        await message.answer("Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
+        await send_with_menu(message, "Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
         return
 
-    await show_tasks(message, my_sheet, "done")
+    await state.update_data(filter_mode="done", filter_sheet=my_sheet)
+    await state.set_state(TasksFilterFSM.choosing_period)
+
+    await message.answer(
+        "Выбери период по сроку задачи (считаем от даты СРОКА):",
+        reply_markup=period_filter_keyboard("done"),
+    )
+
 
 
 @router.message(Command("all"))
