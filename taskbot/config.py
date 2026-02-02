@@ -1,40 +1,41 @@
-# config.py — единое место конфигурации проекта
+# config.py — конфигурация проекта (переменные окружения, списки доступа, константы)
 
-import os  # доступ к переменным окружения
-from pathlib import Path  # удобная работа с путями
-from dotenv import load_dotenv  # загрузка .env
+import os  # env
+from pathlib import Path  # пути
+from dotenv import load_dotenv  # .env
 
-# Загружаем .env один раз при импорте config
-load_dotenv()
+load_dotenv()  # читаем .env
 
-# Читаем настройки из окружения
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()  # токен Telegram-бота
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()  # путь к json ключу
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()  # ID гугл-таблицы
 
-# === Белый список Telegram ID (ВАЖНО) ===
-# Формат в .env:
-# ALLOWED_TELEGRAM_IDS=123,456,789
-_ALLOWED_RAW = os.getenv("ALLOWED_TELEGRAM_IDS", "").strip()
-
-def _parse_allowed_ids(raw: str) -> set[int]:
+def _parse_ids(raw: str) -> set[int]:
     """
-    Парсим строку вида "123,456" в set({123,456}).
-    Пустая строка => пустой set.
+    Парсим строку вида "123,456" в set({123,456})
     """
+    raw = (raw or "").strip()
     if not raw:
         return set()
-    parts = [p.strip() for p in raw.split(",")]  # делим по запятым и чистим пробелы
-    result: set[int] = set()  # итоговый набор
+    parts = [p.strip() for p in raw.split(",")]
+    out: set[int] = set()
     for p in parts:
         if not p:
             continue
-        result.add(int(p))  # преобразуем в int
-    return result
+        out.add(int(p))
+    return out
 
-ALLOWED_TELEGRAM_IDS: set[int] = _parse_allowed_ids(_ALLOWED_RAW)  # whitelist
 
-# --- Проверки конфигурации ---
+# --- базовые настройки ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+
+# --- доступ ---
+ALLOWED_TELEGRAM_IDS: set[int] = _parse_ids(os.getenv("ALLOWED_TELEGRAM_IDS", ""))
+ADMIN_TELEGRAM_IDS: set[int] = _parse_ids(os.getenv("ADMIN_TELEGRAM_IDS", ""))
+
+# админы всегда имеют доступ
+ALLOWED_TELEGRAM_IDS = ALLOWED_TELEGRAM_IDS | ADMIN_TELEGRAM_IDS
+
+# --- проверки ---
 if not BOT_TOKEN:
     raise RuntimeError("Не найден BOT_TOKEN в .env")
 
@@ -44,35 +45,28 @@ if not GOOGLE_SERVICE_ACCOUNT_JSON:
 if not SPREADSHEET_ID:
     raise RuntimeError("Не найден SPREADSHEET_ID в .env")
 
-# Если whitelist пустой — это опасно (бот будет открыт всем).
-# Я делаю строго: если ты включил механику whitelist, то он должен быть заполнен.
-# Если хочешь режим "без ограничений" — скажи, я ослаблю.
 if not ALLOWED_TELEGRAM_IDS:
-    raise RuntimeError(
-        "ALLOWED_TELEGRAM_IDS пустой или не задан в .env. "
-        "Добавь список разрешённых Telegram ID, иначе бот будет открыт всем."
-    )
+    raise RuntimeError("ALLOWED_TELEGRAM_IDS пустой. Добавь список разрешённых Telegram ID в .env")
 
-# --- Пути проекта ---
-# BASE_DIR = корень проекта (там лежат .env и service_account.json)
+if not ADMIN_TELEGRAM_IDS:
+    raise RuntimeError("ADMIN_TELEGRAM_IDS пустой. Добавь Telegram ID админов в .env")
+
+# --- пути ---
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-# Делаем абсолютный путь к JSON ключу (чтобы не зависеть от Working directory)
 SERVICE_ACCOUNT_PATH = (BASE_DIR / GOOGLE_SERVICE_ACCOUNT_JSON).resolve()
 
-# Проверяем, что ключ реально существует
 if not SERVICE_ACCOUNT_PATH.exists():
     raise RuntimeError(f"Файл Service Account не найден: {SERVICE_ACCOUNT_PATH}")
 
-# --- Имена служебных листов ---
-USERS_SHEET = "Users"  # Name <-> TelegramID
-COMMON_SHEET = "Общие"  # общие задачи
-COMMON_PROGRESS_SHEET = "CommonProgress"  # прогресс общих задач
+# --- имена листов ---
+USERS_SHEET = "Users"
+COMMON_SHEET = "Общие"
+COMMON_PROGRESS_SHEET = "CommonProgress"
 
-# --- Заголовки таблиц ---
+# --- заголовки ---
 TASK_HEADERS = ["TaskID", "Task", "From", "Due", "Status", "CreatedAt"]
 COMMON_PROGRESS_HEADERS = ["TaskID", "Name", "Status", "DoneAt"]
 
-# --- Статусы ---
+# --- статусы ---
 STATUS_TODO = "TODO"
 STATUS_DONE = "DONE"

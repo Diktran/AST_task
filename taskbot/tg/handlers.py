@@ -1,23 +1,27 @@
-# handlers.py — все Telegram-команды и callback-обработчики
-# В ЭТОЙ ВЕРСИИ:
-# - добавлены кнопки выбора срока: Сегодня/Завтра/Конец недели/Другой
-# - "Другой" -> включаем ручной ввод даты, как было раньше
-# - сохранены: whitelist, /unregister, запрет повторной регистрации
+# handlers.py — команды и callbacks Telegram-бота
+# Функционал:
+# - whitelist пользователей + админы
+# - регистрация /register (запрет повторной регистрации)
+# - админ-команды /registrations и /unregister <ID|Name>
+# - главное меню кнопками
+# - создание задач через диалог с кнопками срока
+# - просмотр задач (/my /overdue /done /all)
+# - /team_overdue
+# - DONE для личных и общих задач
 
-from __future__ import annotations  # чтобы типы работали стабильно
+from __future__ import annotations
 
-from typing import Optional, Tuple, List  # типы
-import uuid  # генерация коротких TaskID
+from typing import Optional, Tuple, List
+import uuid
 
-from aiogram import Dispatcher, Router, F, Bot  # aiogram
-from aiogram.types import Message, CallbackQuery  # типы апдейтов
-from aiogram.filters import Command  # фильтр команд
-from aiogram.fsm.context import FSMContext  # FSM
-from aiogram.fsm.storage.memory import MemoryStorage  # хранилище FSM
+from aiogram import Dispatcher, Router, F, Bot
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 
-from taskbot.tg.fsm import NewTaskFSM  # состояния
-
-from taskbot.tg.keyboards import (  # клавиатуры
+from taskbot.tg.fsm import NewTaskFSM
+from taskbot.tg.keyboards import (
     assignee_keyboard,
     due_date_keyboard,
     done_personal_keyboard,
@@ -25,15 +29,17 @@ from taskbot.tg.keyboards import (  # клавиатуры
     main_menu_keyboard,
 )
 
-from taskbot.sheets.users import (  # пользователи
+from taskbot.sheets.users import (
     users_get_map,
+    users_list,
     users_upsert,
     users_get_by_telegram_id,
     users_get_by_name,
     users_delete_by_telegram_id,
+    users_delete_by_name,
 )
 
-from taskbot.sheets.tasks import (  # задачи
+from taskbot.sheets.tasks import (
     TaskRow,
     task_append,
     tasks_list,
@@ -41,12 +47,12 @@ from taskbot.sheets.tasks import (  # задачи
     now_iso,
 )
 
-from taskbot.sheets.common import (  # общие задачи
+from taskbot.sheets.common import (
     common_tasks_for_user,
     common_progress_set_done,
 )
 
-from taskbot.utils.dates import (  # даты
+from taskbot.utils.dates import (
     normalize_due_date,
     is_overdue,
     today_iso,
@@ -54,12 +60,12 @@ from taskbot.utils.dates import (  # даты
     end_of_week_iso,
 )
 
-from taskbot.utils.formatters import (  # форматирование
+from taskbot.utils.formatters import (
     format_task_line,
     chunk_text,
 )
 
-from taskbot.config import (  # конфиг
+from taskbot.config import (
     COMMON_SHEET,
     STATUS_TODO,
     STATUS_DONE,
@@ -67,21 +73,20 @@ from taskbot.config import (  # конфиг
     ADMIN_TELEGRAM_IDS,
 )
 
+router = Router()
 
-router = Router()  # роутер
+
+# ---------- access helpers ----------
 
 def is_admin(user_id: int) -> bool:
-    """Проверяем, является ли пользователь админом."""
     return user_id in ADMIN_TELEGRAM_IDS
 
 
 def is_allowed(user_id: int) -> bool:
-    """Доступ разрешён, если в whitelist ИЛИ админ."""
     return (user_id in ALLOWED_TELEGRAM_IDS) or is_admin(user_id)
 
 
 async def deny_if_not_allowed(message: Message) -> bool:
-    """Проверка доступа для message-хендлеров. True = доступ запрещён."""
     if not is_allowed(message.from_user.id):
         await message.answer("⛔ Доступ запрещён. Твой Telegram ID не в белом списке.")
         return True
@@ -89,7 +94,6 @@ async def deny_if_not_allowed(message: Message) -> bool:
 
 
 async def deny_cb_if_not_allowed(callback: CallbackQuery) -> bool:
-    """Проверка доступа для callback-хендлеров. True = доступ запрещён."""
     if not is_allowed(callback.from_user.id):
         await callback.message.answer("⛔ Доступ запрещён. Твой Telegram ID не в белом списке.")
         await callback.answer()
@@ -97,41 +101,50 @@ async def deny_cb_if_not_allowed(callback: CallbackQuery) -> bool:
     return False
 
 
+async def deny_if_not_admin(message: Message) -> bool:
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Команда доступна только администраторам.")
+        return True
+    return False
+
+
+# ---------- misc helpers ----------
+
+def uuid_short() -> str:
+    return uuid.uuid4().hex[:8]
+
+
 def get_my_sheet_name_or_none(telegram_id: int, users_map: dict[str, int]) -> Optional[str]:
-    """Находим имя вкладки пользователя по TelegramID."""
     for name, tid in users_map.items():
         if tid == telegram_id:
             return name
     return None
 
 
-def uuid_short() -> str:
-    """Короткий TaskID (8 символов)."""
-    return uuid.uuid4().hex[:8]
+def _parse_unregister_target(arg: str) -> Tuple[Optional[int], Optional[str]]:
+    arg = (arg or "").strip()
+    if not arg:
+        return None, None
+    if arg.isdigit():
+        return int(arg), None
+    return None, arg
 
+
+# ---------- commands ----------
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    """Инструкция."""
     await message.answer(
         "Привет! Я бот задач.\n\n"
-        "Регистрация:\n"
+        "Если у тебя есть доступ, зарегистрируйся:\n"
         "/register <ИмяВкладки>\n\n"
-        "Можно пользоваться кнопками меню снизу 👇",
+        "Можно работать через меню кнопками 👇",
         reply_markup=main_menu_keyboard(is_admin(message.from_user.id)),
     )
 
 
 @router.message(Command("register"))
 async def cmd_register(message: Message):
-    """
-    /register <ИмяВкладки>
-
-    Правила:
-      1) Только пользователи из белого списка могут регистрироваться
-      2) Нельзя регистрироваться повторно с одного TelegramID
-      3) Нельзя занять имя вкладки, которое уже привязано к другому TelegramID
-    """
     if await deny_if_not_allowed(message):
         return
 
@@ -149,7 +162,7 @@ async def cmd_register(message: Message):
         await message.answer(
             f"⛔ Ты уже зарегистрирован как '{existing_name}'.\n"
             f"Повторная регистрация запрещена.\n"
-            f"Если нужно сменить имя — сначала сделай /unregister, потом /register <Имя>."
+            f"Если нужно изменить регистрацию — попроси админа удалить её."
         )
         return
 
@@ -160,55 +173,73 @@ async def cmd_register(message: Message):
 
     await users_upsert(sheet_name, telegram_id)
 
-
     await message.answer(
         f"Готово ✅ Ты зарегистрирован как '{sheet_name}'.\n"
-        f"Теперь можно работать через меню снизу 👇",
+        f"Теперь можно работать через меню 👇",
         reply_markup=main_menu_keyboard(is_admin(message.from_user.id)),
-        )
+    )
+
+
+@router.message(Command("registrations"))
+async def cmd_registrations(message: Message):
+    if await deny_if_not_allowed(message):
+        return
+    if await deny_if_not_admin(message):
+        return
+
+    regs = await users_list()
+    if not regs:
+        await message.answer("Регистраций нет.")
+        return
+
+    lines = [f"• {name} — {tid}" for name, tid in sorted(regs, key=lambda x: (x[0].lower(), x[1]))]
+    for part in chunk_text(lines):
+        await message.answer(part)
 
 
 @router.message(Command("unregister"))
 async def cmd_unregister(message: Message):
-    """
-    /unregister
-    Удаляем строку из Users по TelegramID.
-    Личный лист задач НЕ удаляем (чтобы не терять историю).
-    """
     if await deny_if_not_allowed(message):
         return
-
-    telegram_id = message.from_user.id
-
-    deleted_name = await users_delete_by_telegram_id(telegram_id)
-    if deleted_name is None:
-        await message.answer("Ты не зарегистрирован. Удалять нечего.")
+    if await deny_if_not_admin(message):
         return
 
-    await message.answer(
-        f"Готово ✅ Регистрация удалена (было имя: '{deleted_name}').\n"
-        f"Теперь можно зарегистрироваться заново: /register <ИмяВкладки>"
-    )
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /unregister <TelegramID|Name>\nПример: /unregister 123456789 или /unregister Иван")
+        return
+
+    telegram_id, name = _parse_unregister_target(parts[1])
+
+    if telegram_id is not None:
+        deleted_name = await users_delete_by_telegram_id(telegram_id)
+        if deleted_name is None:
+            await message.answer("Не нашёл регистрацию по этому TelegramID.")
+            return
+        await message.answer(f"Готово ✅ Удалил регистрацию: {deleted_name} — {telegram_id}")
+        return
+
+    if name is not None:
+        deleted_tid = await users_delete_by_name(name)
+        if deleted_tid is None:
+            await message.answer("Не нашёл регистрацию по этому имени.")
+            return
+        await message.answer(f"Готово ✅ Удалил регистрацию: {name} — {deleted_tid}")
+        return
+
+    await message.answer("Не понял, кого удалять. Пример: /unregister 123456789 или /unregister Иван")
 
 
 @router.message(Command("newtask"))
 async def cmd_newtask(message: Message, state: FSMContext):
-    """
-    /newtask — старт диалога.
-    """
     if await deny_if_not_allowed(message):
         return
 
     users_map = await users_get_map()
 
-    # инициатор должен быть зарегистрирован
     my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
     if not my_sheet:
         await message.answer("Ты не зарегистрирован. Сначала сделай: /register <ИмяВкладки>")
-        return
-
-    if not users_map:
-        await message.answer("Пока нет зарегистрированных пользователей. Сначала сделайте /register <ИмяВкладки>.")
         return
 
     await state.update_data(from_name=message.from_user.full_name)
@@ -217,9 +248,47 @@ async def cmd_newtask(message: Message, state: FSMContext):
     await message.answer("Кому поставить задачу?", reply_markup=assignee_keyboard(list(users_map.keys())))
 
 
+# ---------- menu buttons (reply keyboard) ----------
+
+@router.message(F.text == "➕ Новая задача")
+async def btn_newtask(message: Message, state: FSMContext):
+    await cmd_newtask(message, state)
+
+
+@router.message(F.text == "📋 Мои задачи")
+async def btn_my(message: Message):
+    await cmd_my(message)
+
+
+@router.message(F.text == "⏰ Просроченные")
+async def btn_overdue(message: Message):
+    await cmd_overdue(message)
+
+
+@router.message(F.text == "✅ Выполненные")
+async def btn_done(message: Message):
+    await cmd_done(message)
+
+
+@router.message(F.text == "📦 Все")
+async def btn_all(message: Message):
+    await cmd_all(message)
+
+
+@router.message(F.text == "🧾 Помощь")
+async def btn_help(message: Message):
+    await cmd_start(message)
+
+
+@router.message(F.text == "👥 Регистрации")
+async def btn_registrations(message: Message):
+    await cmd_registrations(message)
+
+
+# ---------- FSM: create task ----------
+
 @router.callback_query(NewTaskFSM.choosing_assignee, F.data.startswith("assignee:"))
 async def pick_assignee(callback: CallbackQuery, state: FSMContext):
-    """Выбор исполнителя."""
     if await deny_cb_if_not_allowed(callback):
         return
 
@@ -234,7 +303,6 @@ async def pick_assignee(callback: CallbackQuery, state: FSMContext):
 
 @router.message(NewTaskFSM.entering_task_text)
 async def enter_task_text(message: Message, state: FSMContext):
-    """Ввод текста задачи."""
     if await deny_if_not_allowed(message):
         return
 
@@ -244,8 +312,6 @@ async def enter_task_text(message: Message, state: FSMContext):
         return
 
     await state.update_data(task_text=task_text)
-
-    # ВМЕСТО ручного ввода даты сразу — показываем кнопки срока
     await state.set_state(NewTaskFSM.choosing_due_preset)
 
     await message.answer("Выбери срок задачи:", reply_markup=due_date_keyboard())
@@ -253,24 +319,17 @@ async def enter_task_text(message: Message, state: FSMContext):
 
 @router.callback_query(NewTaskFSM.choosing_due_preset, F.data.startswith("due:"))
 async def pick_due_preset(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    """
-    Выбор срока кнопкой.
-    Если "Другой" — переводим в ручной ввод.
-    Если preset — сразу создаём задачу (как раньше после ввода даты).
-    """
     if await deny_cb_if_not_allowed(callback):
         return
 
-    preset = callback.data.split(":", 1)[1].strip()  # today/tomorrow/eow/other
+    preset = callback.data.split(":", 1)[1].strip()
 
-    # Если пользователь выбрал "Другой" — просим ввести дату текстом
     if preset == "other":
         await state.set_state(NewTaskFSM.entering_due_date_manual)
         await callback.message.answer("Введи срок (например 2026-02-05 или 05.02.2026).")
         await callback.answer()
         return
 
-    # Пресеты дат
     if preset == "today":
         due_iso = today_iso()
     elif preset == "tomorrow":
@@ -278,19 +337,16 @@ async def pick_due_preset(callback: CallbackQuery, state: FSMContext, bot: Bot):
     elif preset == "eow":
         due_iso = end_of_week_iso()
     else:
-        # На всякий случай (если пришло что-то неожиданное)
         await callback.message.answer("Неизвестный вариант срока. Выбери ещё раз.")
         await callback.answer()
         return
 
-    # Создаём задачу с выбранной датой
-    await create_task_and_notify(callback.message, state, bot, due_iso, chosen_via_buttons=True)
+    await create_task_and_notify(callback.message, state, bot, due_iso)
     await callback.answer()
 
 
 @router.message(NewTaskFSM.entering_due_date_manual)
 async def enter_due_date_manual(message: Message, state: FSMContext, bot: Bot):
-    """Ручной ввод даты (как было раньше)."""
     if await deny_if_not_allowed(message):
         return
 
@@ -302,21 +358,10 @@ async def enter_due_date_manual(message: Message, state: FSMContext, bot: Bot):
         await message.answer("Не смог распознать дату. Пример: 2026-02-05 или 05.02.2026. Попробуй ещё раз.")
         return
 
-    await create_task_and_notify(message, state, bot, due_iso, chosen_via_buttons=False)
+    await create_task_and_notify(message, state, bot, due_iso)
 
 
-async def create_task_and_notify(message: Message, state: FSMContext, bot: Bot, due_iso: str, chosen_via_buttons: bool):
-    """
-    Общая функция:
-      - собирает данные FSM (assignee, task_text, from_name)
-      - создаёт TaskRow
-      - пишет в Sheets
-      - уведомляет исполнителя (если личная)
-      - отвечает автору
-      - очищает FSM
-
-    chosen_via_buttons — просто для текста/отладки (не обязательно), оставил как параметр.
-    """
+async def create_task_and_notify(message: Message, state: FSMContext, bot: Bot, due_iso: str):
     data = await state.get_data()
 
     assignee = data["assignee"]
@@ -335,32 +380,21 @@ async def create_task_and_notify(message: Message, state: FSMContext, bot: Bot, 
         created_at=created_at,
     )
 
-    # записываем задачу (в личный лист или "Общие")
     await task_append(assignee, row)
 
-    # уведомление исполнителя (только для личной задачи)
     if assignee != COMMON_SHEET:
         users_map = await users_get_map()
         if assignee in users_map:
-            assignee_tid = users_map[assignee]
             try:
                 await bot.send_message(
-                    assignee_tid,
+                    users_map[assignee],
                     "📬 Новая задача!\n\n"
-                    + format_task_line(
-                        row.task_id,
-                        row.task,
-                        row.from_name,
-                        row.due_str,
-                        row.status,
-                        is_common=False,
-                    )
+                    + format_task_line(row.task_id, row.task, row.from_name, row.due_str, row.status, is_common=False)
                     + "\n\nПосмотреть: /my",
                 )
             except Exception:
                 pass
 
-    # подтверждение автору
     await message.answer(
         "Готово ✅ Задача создана.\n\n"
         + format_task_line(
@@ -376,13 +410,9 @@ async def create_task_and_notify(message: Message, state: FSMContext, bot: Bot, 
     await state.clear()
 
 
+# ---------- tasks view ----------
+
 async def show_tasks(message: Message, my_sheet_name: str, mode: str):
-    """
-    Показ задач пользователя:
-      - личные
-      - общие (персонально)
-    mode: my / overdue / done / all
-    """
     personal = await tasks_list(my_sheet_name)
 
     if mode == "my":
@@ -403,7 +433,7 @@ async def show_tasks(message: Message, my_sheet_name: str, mode: str):
         return
 
     def sort_key(item: Tuple[TaskRow, bool]):
-        t, _is_common = item
+        t, _ = item
         overdue_flag = 0 if (t.due_str and t.status != STATUS_DONE and is_overdue(t.due_str)) else 1
         due_val = t.due_str or "9999-12-31"
         return (overdue_flag, due_val)
@@ -421,17 +451,10 @@ async def show_tasks(message: Message, my_sheet_name: str, mode: str):
     for (t, is_common) in combined:
         if t.status == STATUS_DONE:
             continue
-
         if is_common:
-            await message.answer(
-                f"Отметить выполненной ОБЩУЮ задачу [{t.task_id}]?",
-                reply_markup=done_common_keyboard(t.task_id),
-            )
+            await message.answer(f"Отметить выполненной ОБЩУЮ задачу [{t.task_id}]?", reply_markup=done_common_keyboard(t.task_id))
         else:
-            await message.answer(
-                f"Отметить выполненной задачу [{t.task_id}]?",
-                reply_markup=done_personal_keyboard(my_sheet_name, t.task_id),
-            )
+            await message.answer(f"Отметить выполненной задачу [{t.task_id}]?", reply_markup=done_personal_keyboard(my_sheet_name, t.task_id))
 
 
 @router.message(Command("my"))
@@ -509,7 +532,6 @@ async def cmd_team_overdue(message: Message):
     for name in sorted(users_map.keys()):
         personal = await tasks_list(name)
         personal_overdue = [t for t in personal if t.status != STATUS_DONE and t.due_str and is_overdue(t.due_str)]
-
         common_overdue = await common_tasks_for_user(name, "overdue")
 
         if personal_overdue or common_overdue:
@@ -527,6 +549,8 @@ async def cmd_team_overdue(message: Message):
     for part in chunk_text(out):
         await message.answer(part)
 
+
+# ---------- DONE callbacks ----------
 
 @router.callback_query(F.data.startswith("done_personal:"))
 async def cb_done_personal(callback: CallbackQuery):
@@ -564,56 +588,8 @@ async def cb_done_common(callback: CallbackQuery):
     await callback.message.answer(f"Готово ✅ Общая задача [{task_id}] отмечена DONE для {my_name}.")
     await callback.answer()
 
-@router.message(F.text == "➕ Новая задача")
-async def btn_newtask(message: Message, state: FSMContext):
-    """
-    Кнопка меню: ➕ Новая задача
-    Вызываем ту же логику, что и /newtask.
-    """
-    await cmd_newtask(message, state)
-
-
-@router.message(F.text == "📋 Мои задачи")
-async def btn_my(message: Message):
-    """Кнопка меню: 📋 Мои задачи"""
-    await cmd_my(message)
-
-
-@router.message(F.text == "⏰ Просроченные")
-async def btn_overdue(message: Message):
-    """Кнопка меню: ⏰ Просроченные"""
-    await cmd_overdue(message)
-
-
-@router.message(F.text == "✅ Выполненные")
-async def btn_done(message: Message):
-    """Кнопка меню: ✅ Выполненные"""
-    await cmd_done(message)
-
-
-@router.message(F.text == "📦 Все")
-async def btn_all(message: Message):
-    """Кнопка меню: 📦 Все"""
-    await cmd_all(message)
-
-
-@router.message(F.text == "🧾 Помощь")
-async def btn_help(message: Message):
-    """Кнопка меню: 🧾 Помощь (просто текст подсказки)"""
-    await cmd_start(message)
-
-
-@router.message(F.text == "👥 Регистрации")
-async def btn_registrations(message: Message):
-    """
-    Кнопка меню: 👥 Регистрации
-    Доступна только админам (мы всё равно проверим внутри команды).
-    """
-    await cmd_registrations(message)
-
 
 def build_dispatcher() -> Dispatcher:
-    """Собираем Dispatcher и подключаем router."""
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     return dp

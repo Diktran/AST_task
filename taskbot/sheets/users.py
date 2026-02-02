@@ -1,48 +1,63 @@
-# users.py — регистрация пользователей, поиск и удаление
+# users.py — регистрация в Users, список регистраций, удаление
 
-from typing import Dict, Optional, Tuple  # типы
+from typing import Dict, Optional, List, Tuple
 
-from taskbot.sheets.schema import ensure_worksheet_exists, ensure_headers  # листы/заголовки
-from taskbot.config import USERS_SHEET, TASK_HEADERS  # имена листов/заголовки задач
-from taskbot.sheets.client import gs_to_thread  # async обёртка
+from taskbot.sheets.schema import ensure_worksheet_exists, ensure_headers
+from taskbot.config import USERS_SHEET, TASK_HEADERS
+from taskbot.sheets.client import gs_to_thread
 
 
 def users_get_map_sync() -> Dict[str, int]:
-    """
-    Синхронно читаем Users и возвращаем {Name: TelegramID}.
-    """
-    ws = ensure_worksheet_exists(USERS_SHEET)  # получаем/создаём лист Users
-    ensure_headers(ws, ["Name", "TelegramID"])  # гарантируем заголовки
+    ws = ensure_worksheet_exists(USERS_SHEET)
+    ensure_headers(ws, ["Name", "TelegramID"])
 
-    values = ws.get_all_values()  # читаем все строки
-    result: Dict[str, int] = {}   # итоговый словарь
+    values = ws.get_all_values()
+    out: Dict[str, int] = {}
 
-    for row in values[1:]:  # пропускаем заголовок
-        if len(row) < 2:  # если строка неполная
+    for row in values[1:]:
+        if len(row) < 2:
             continue
-        name = row[0].strip()  # имя листа
-        tid_raw = row[1].strip()  # TelegramID строкой
+        name = row[0].strip()
+        tid_raw = row[1].strip()
         if not name or not tid_raw:
             continue
         try:
-            result[name] = int(tid_raw)  # записываем
+            out[name] = int(tid_raw)
         except ValueError:
             continue
 
-    return result
+    return out
+
+
+def users_list_sync() -> List[Tuple[str, int]]:
+    ws = ensure_worksheet_exists(USERS_SHEET)
+    ensure_headers(ws, ["Name", "TelegramID"])
+
+    values = ws.get_all_values()
+    out: List[Tuple[str, int]] = []
+
+    for row in values[1:]:
+        if len(row) < 2:
+            continue
+        name = row[0].strip()
+        tid_raw = row[1].strip()
+        if not name or not tid_raw:
+            continue
+        try:
+            out.append((name, int(tid_raw)))
+        except ValueError:
+            continue
+
+    return out
 
 
 def users_get_by_telegram_id_sync(telegram_id: int) -> Optional[str]:
-    """
-    Синхронно ищем пользователя по TelegramID и возвращаем Name (имя вкладки).
-    Если не найден — None.
-    """
-    ws = ensure_worksheet_exists(USERS_SHEET)  # Users лист
-    ensure_headers(ws, ["Name", "TelegramID"])  # заголовки
+    ws = ensure_worksheet_exists(USERS_SHEET)
+    ensure_headers(ws, ["Name", "TelegramID"])
 
-    values = ws.get_all_values()  # все строки
+    values = ws.get_all_values()
 
-    for row in values[1:]:  # пропускаем заголовок
+    for row in values[1:]:
         if len(row) < 2:
             continue
         name = row[0].strip()
@@ -51,18 +66,14 @@ def users_get_by_telegram_id_sync(telegram_id: int) -> Optional[str]:
             continue
         try:
             if int(tid_raw) == telegram_id:
-                return name  # нашли
+                return name
         except ValueError:
             continue
 
-    return None  # не нашли
+    return None
 
 
 def users_get_by_name_sync(name: str) -> Optional[int]:
-    """
-    Синхронно ищем TelegramID по Name (имени вкладки).
-    Если не найден — None.
-    """
     ws = ensure_worksheet_exists(USERS_SHEET)
     ensure_headers(ws, ["Name", "TelegramID"])
 
@@ -83,44 +94,29 @@ def users_get_by_name_sync(name: str) -> Optional[int]:
 
 
 def users_upsert_sync(name: str, telegram_id: int) -> None:
-    """
-    Синхронно добавляем/обновляем пользователя.
-    ВАЖНО: тут нет логики запретов — запреты делаются на уровне handlers.py.
+    ws = ensure_worksheet_exists(USERS_SHEET)
+    ensure_headers(ws, ["Name", "TelegramID"])
 
-    Также создаём личный лист name и ставим заголовки задач.
-    """
-    ws = ensure_worksheet_exists(USERS_SHEET)  # Users лист
-    ensure_headers(ws, ["Name", "TelegramID"])  # заголовки Users
+    values = ws.get_all_values()
 
-    values = ws.get_all_values()  # читаем все строки
-
-    # ищем строку по name
     for idx, row in enumerate(values[1:], start=2):
         if len(row) >= 1 and row[0].strip() == name:
-            ws.update(f"A{idx}:B{idx}", [[name, str(telegram_id)]])  # обновляем
+            ws.update(f"A{idx}:B{idx}", [[name, str(telegram_id)]])
             break
     else:
-        ws.append_row([name, str(telegram_id)], value_input_option="RAW")  # добавляем
+        ws.append_row([name, str(telegram_id)], value_input_option="RAW")
 
-    # создаём/получаем личный лист и ставим заголовки задач
     ws_personal = ensure_worksheet_exists(name)
     ensure_headers(ws_personal, TASK_HEADERS)
 
 
 def users_delete_by_telegram_id_sync(telegram_id: int) -> Optional[str]:
-    """
-    Синхронно удаляем регистрацию пользователя по TelegramID.
-    Возвращаем Name (имя вкладки), если удалили. Если не нашли — None.
+    ws = ensure_worksheet_exists(USERS_SHEET)
+    ensure_headers(ws, ["Name", "TelegramID"])
 
-    ВАЖНО: мы удаляем только строку из Users.
-    Лист с задачами (вкладка) НЕ удаляется, чтобы не потерять данные.
-    """
-    ws = ensure_worksheet_exists(USERS_SHEET)  # Users лист
-    ensure_headers(ws, ["Name", "TelegramID"])  # заголовки
+    values = ws.get_all_values()
 
-    values = ws.get_all_values()  # все строки
-
-    for idx, row in enumerate(values[1:], start=2):  # idx = номер строки в Sheets
+    for idx, row in enumerate(values[1:], start=2):
         if len(row) < 2:
             continue
         name = row[0].strip()
@@ -129,18 +125,44 @@ def users_delete_by_telegram_id_sync(telegram_id: int) -> Optional[str]:
             continue
         try:
             if int(tid_raw) == telegram_id:
-                ws.delete_rows(idx)  # удаляем строку регистрации
-                return name  # возвращаем имя вкладки
+                ws.delete_rows(idx)
+                return name
         except ValueError:
             continue
 
-    return None  # не нашли
+    return None
 
 
-# --- Async обёртки (чтобы вызывать из aiogram) ---
+def users_delete_by_name_sync(name: str) -> Optional[int]:
+    ws = ensure_worksheet_exists(USERS_SHEET)
+    ensure_headers(ws, ["Name", "TelegramID"])
+
+    values = ws.get_all_values()
+
+    for idx, row in enumerate(values[1:], start=2):
+        if len(row) < 2:
+            continue
+        n = row[0].strip()
+        tid_raw = row[1].strip()
+        if n == name:
+            try:
+                tid = int(tid_raw) if tid_raw else 0
+            except ValueError:
+                tid = 0
+            ws.delete_rows(idx)
+            return tid if tid else None
+
+    return None
+
+
+# --- async wrappers ---
 
 async def users_get_map() -> Dict[str, int]:
     return await gs_to_thread(users_get_map_sync)
+
+
+async def users_list() -> List[Tuple[str, int]]:
+    return await gs_to_thread(users_list_sync)
 
 
 async def users_get_by_telegram_id(telegram_id: int) -> Optional[str]:
@@ -157,3 +179,7 @@ async def users_upsert(name: str, telegram_id: int) -> None:
 
 async def users_delete_by_telegram_id(telegram_id: int) -> Optional[str]:
     return await gs_to_thread(users_delete_by_telegram_id_sync, telegram_id)
+
+
+async def users_delete_by_name(name: str) -> Optional[int]:
+    return await gs_to_thread(users_delete_by_name_sync, name)

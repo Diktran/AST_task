@@ -1,66 +1,62 @@
-# keyboards.py — все inline-кнопки
+# keyboards.py — inline и reply клавиатуры
 
-from aiogram.utils.keyboard import InlineKeyboardBuilder  # builder клавиатур
-from taskbot.config import COMMON_SHEET  # имя листа общих задач
+from aiogram.utils.keyboard import InlineKeyboardBuilder  # inline builder
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton  # reply keyboard
+
+from taskbot.config import COMMON_SHEET  # вкладка общих задач
 
 
 def assignee_keyboard(user_names: list[str]):
     """
-    Клавиатура выбора исполнителя:
-      - кнопки людей
-      - кнопка 📌 Общие
+    Клавиатура выбора исполнителя + 📌 Общие
     """
     kb = InlineKeyboardBuilder()
 
-    # кнопки людей
     for name in sorted(user_names):
         kb.button(text=name, callback_data=f"assignee:{name}")
 
-    # кнопка общих задач
     kb.button(text="📌 Общие", callback_data=f"assignee:{COMMON_SHEET}")
 
-    kb.adjust(2)  # по 2 кнопки в ряд
+    kb.adjust(2)
     return kb.as_markup()
 
 
 def due_date_keyboard():
     """
     Клавиатура выбора срока:
-      - Сегодня
-      - Завтра
-      - Конец недели
-      - Другой (ручной ввод)
+    Сегодня / Завтра / Конец недели (пятница) / Другой
     """
     kb = InlineKeyboardBuilder()
-
-    kb.button(text="Сегодня", callback_data="due:today")      # пресет сегодня
-    kb.button(text="Завтра", callback_data="due:tomorrow")   # пресет завтра
-    kb.button(text="Конец недели", callback_data="due:eow")  # конец недели
-    kb.button(text="Другой", callback_data="due:other")      # ручной ввод
-
-    kb.adjust(2)  # 2 в ряд
+    kb.button(text="Сегодня", callback_data="due:today")
+    kb.button(text="Завтра", callback_data="due:tomorrow")
+    kb.button(text="Конец недели", callback_data="due:eow")
+    kb.button(text="Другой", callback_data="due:other")
+    kb.adjust(2)
     return kb.as_markup()
 
 
 def done_personal_keyboard(sheet_name: str, task_id: str):
-    """Кнопка DONE для личной задачи."""
+    """
+    DONE для личной задачи
+    """
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Done", callback_data=f"done_personal:{sheet_name}:{task_id}")
     return kb.as_markup()
 
 
 def done_common_keyboard(task_id: str):
-    """Кнопка DONE для общей задачи."""
+    """
+    DONE для общей задачи (персонально)
+    """
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Done", callback_data=f"done_common:{task_id}")
     return kb.as_markup()
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton  # меню-кнопки
 
 
 def main_menu_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
     """
-    Главное меню бота (кнопки снизу).
-    is_admin=True -> добавляем админ-кнопки.
+    Главное меню (кнопки снизу).
+    Админ видит дополнительно “👥 Регистрации”.
     """
     rows = [
         [KeyboardButton(text="➕ Новая задача")],
@@ -69,13 +65,12 @@ def main_menu_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🧾 Помощь")],
     ]
 
-    # Если пользователь админ — показываем ещё кнопку “Регистрации”
     if is_admin:
         rows.insert(3, [KeyboardButton(text="👥 Регистрации")])
 
     return ReplyKeyboardMarkup(
         keyboard=rows,
-        resize_keyboard=True,  # чтобы красиво помещалось
-        one_time_keyboard=False,  # меню остаётся
+        resize_keyboard=True,
+        one_time_keyboard=False,
         selective=False,
     )
