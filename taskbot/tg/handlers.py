@@ -625,8 +625,6 @@ async def create_task_and_notify(message: Message, state: FSMContext, bot: Bot, 
     task_id = await task_append(assignee, row)  # ✅ получили номер
     row.task_id = task_id
 
-    await task_append(assignee, row)
-
     if assignee != COMMON_SHEET:
         users_map = await users_get_map()
         if assignee in users_map:
@@ -992,6 +990,170 @@ async def cb_done_common(callback: CallbackQuery):
 
     await callback.message.answer(f"Готово ✅ Общая задача [{task_id}] отмечена DONE для {my_name}.")
     await callback.answer()
+
+# ---------- ADMIN: edit / delete / status callbacks ----------
+
+@router.callback_query(F.data.startswith("admin_toggle:"))
+async def cb_admin_toggle(callback: CallbackQuery):
+    """
+    Админ: переключить статус задачи TODO/DONE.
+    callback_data: admin_toggle:<sheet>:<task_id>:TODO|DONE
+    """
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Только админам.")
+        await callback.answer()
+        return
+
+    _p, sheet, task_id, new_status = callback.data.split(":", 3)
+
+    ok = await task_set_status(sheet, task_id, new_status)
+    if ok:
+        await callback.message.answer(f"✅ Готово. Задача [{task_id}] теперь в статусе: {new_status}")
+    else:
+        await callback.message.answer("Не нашёл задачу (возможно удалили или изменили ID).")
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_delete:"))
+async def cb_admin_delete(callback: CallbackQuery):
+    """
+    Админ: удалить задачу.
+    callback_data: admin_delete:<sheet>:<task_id>
+    """
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Только админам.")
+        await callback.answer()
+        return
+
+    _p, sheet, task_id = callback.data.split(":", 2)
+
+    ok = await task_delete(sheet, task_id)
+    if ok:
+        await callback.message.answer(f"🗑 Удалено. Задача [{task_id}] удалена.")
+    else:
+        await callback.message.answer("Не нашёл задачу (возможно уже удалена).")
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_edit_text:"))
+async def cb_admin_edit_text(callback: CallbackQuery, state: FSMContext):
+    """
+    Админ: начать редактирование текста задачи.
+    callback_data: admin_edit_text:<sheet>:<task_id>
+    """
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Только админам.")
+        await callback.answer()
+        return
+
+    _p, sheet, task_id = callback.data.split(":", 2)
+
+    await state.update_data(edit_sheet=sheet, edit_task_id=task_id)
+    await state.set_state(AdminTasksFSM.editing_text)
+
+    await callback.message.answer(f"✏️ Введи новый ТЕКСТ для задачи [{task_id}]:")
+    await callback.answer()
+
+
+@router.message(AdminTasksFSM.editing_text)
+async def admin_edit_text_enter(message: Message, state: FSMContext):
+    """
+    Админ прислал новый текст -> обновляем Task.
+    """
+    if await deny_if_not_allowed(message):
+        return
+    if await deny_if_not_admin(message):
+        return
+
+    new_text = (message.text or "").strip()
+    if not new_text:
+        await send_with_menu(message, "Текст пустой. Введи текст ещё раз.")
+        return
+
+    data = await state.get_data()
+    sheet = data.get("edit_sheet")
+    task_id = data.get("edit_task_id")
+
+    if not sheet or not task_id:
+        await send_with_menu(message, "Ошибка состояния редактирования. Открой 🛠 Админ: задачи заново.")
+        await state.clear()
+        return
+
+    ok = await task_update_text(sheet, task_id, new_text)
+    if ok:
+        await send_with_menu(message, f"✅ Готово. Текст задачи [{task_id}] обновлён.")
+    else:
+        await send_with_menu(message, "Не нашёл задачу (возможно удалили или изменили ID).")
+
+    # возвращаемся в админ-режим выбора (чтобы можно было продолжить)
+    await state.set_state(AdminTasksFSM.choosing_view)
+
+
+@router.callback_query(F.data.startswith("admin_edit_due:"))
+async def cb_admin_edit_due(callback: CallbackQuery, state: FSMContext):
+    """
+    Админ: начать редактирование срока задачи.
+    callback_data: admin_edit_due:<sheet>:<task_id>
+    """
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Только админам.")
+        await callback.answer()
+        return
+
+    _p, sheet, task_id = callback.data.split(":", 2)
+
+    await state.update_data(edit_sheet=sheet, edit_task_id=task_id)
+    await state.set_state(AdminTasksFSM.editing_due)
+
+    await callback.message.answer(
+        f"📅 Введи новый СРОК для задачи [{task_id}] (например 2026-02-10 или 10.02.2026):"
+    )
+    await callback.answer()
+
+
+@router.message(AdminTasksFSM.editing_due)
+async def admin_edit_due_enter(message: Message, state: FSMContext):
+    """
+    Админ прислал новую дату -> обновляем Due.
+    """
+    if await deny_if_not_allowed(message):
+        return
+    if await deny_if_not_admin(message):
+        return
+
+    raw = (message.text or "").strip()
+    try:
+        due_iso = normalize_due_date(raw)
+    except Exception:
+        await send_with_menu(message, "Не понял дату. Пример: 2026-02-10 или 10.02.2026. Введи ещё раз.")
+        return
+
+    data = await state.get_data()
+    sheet = data.get("edit_sheet")
+    task_id = data.get("edit_task_id")
+
+    if not sheet or not task_id:
+        await send_with_menu(message, "Ошибка состояния редактирования. Открой 🛠 Админ: задачи заново.")
+        await state.clear()
+        return
+
+    ok = await task_update_due(sheet, task_id, due_iso)
+    if ok:
+        await send_with_menu(message, f"✅ Готово. Срок задачи [{task_id}] обновлён на {due_iso}.")
+    else:
+        await send_with_menu(message, "Не нашёл задачу (возможно удалили или изменили ID).")
+
+    await state.set_state(AdminTasksFSM.choosing_view)
 
 
 #ЧЕПУХА
