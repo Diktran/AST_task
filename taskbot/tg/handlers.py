@@ -12,14 +12,14 @@
 from __future__ import annotations
 from datetime import date, timedelta
 from typing import Optional, Tuple, List
-import uuid
+#import uuid
 
 from aiogram import Dispatcher, Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from taskbot.tg.fsm import NewTaskFSM, TasksFilterFSM
+from taskbot.tg.fsm import NewTaskFSM, TasksFilterFSM, AdminTasksFSM
 from taskbot.tg.keyboards import (
     assignee_keyboard,
     due_date_keyboard,
@@ -27,6 +27,10 @@ from taskbot.tg.keyboards import (
     done_common_keyboard,
     main_menu_keyboard,
     period_filter_keyboard,
+    admin_users_keyboard,          # ✅
+    admin_view_keyboard,           # ✅
+    admin_task_actions_keyboard,   # ✅
+    admin_period_filter_keyboard,
 )
 
 from taskbot.sheets.users import (
@@ -44,8 +48,14 @@ from taskbot.sheets.tasks import (
     task_append,
     tasks_list,
     task_set_done,
+    task_set_todo,
+    task_set_status,
+    task_update_text,
+    task_update_due,
+    task_delete,
     now_iso,
 )
+
 
 from taskbot.sheets.common import (
     common_tasks_for_user,
@@ -92,6 +102,194 @@ async def deny_if_not_allowed(message: Message) -> bool:
         return True
     return False
 
+@router.message(F.text.startswith("🛠"))
+async def btn_admin_tasks(message: Message, state: FSMContext):
+    if await deny_if_not_allowed(message):
+        return
+    if await deny_if_not_admin(message):
+        return
+
+    users_map = await users_get_map()
+    await state.update_data(admin_users=list(users_map.keys()))
+    await state.set_state(AdminTasksFSM.choosing_user)
+
+    await message.answer(
+        "Выбери пользователя для просмотра задач:",
+        reply_markup=admin_users_keyboard(list(users_map.keys())),
+    )
+
+
+@router.callback_query(AdminTasksFSM.choosing_user, F.data.startswith("admin_user:"))
+async def admin_pick_user(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Только админам.")
+        await callback.answer()
+        return
+
+    sheet = callback.data.split(":", 1)[1].strip()
+    await state.update_data(admin_sheet=sheet)
+    await state.set_state(AdminTasksFSM.choosing_view)
+
+    await callback.message.answer(
+        f"Ок. Выбран лист: {sheet}\nВыбери режим просмотра:",
+        reply_markup=admin_view_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminTasksFSM.choosing_view, F.data.startswith("admin_view:"))
+async def admin_pick_view(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Только админам.")
+        await callback.answer()
+        return
+
+    mode = callback.data.split(":", 1)[1].strip()  # my/overdue/done/all
+    data = await state.get_data()
+    sheet = data.get("admin_sheet")
+    if not sheet:
+        await callback.message.answer("Не выбран пользователь. Нажми 🛠 Админ: задачи ещё раз.")
+        await callback.answer()
+        return
+
+    await state.update_data(admin_view_mode=mode)
+    await state.set_state(AdminTasksFSM.choosing_period)
+
+    await callback.message.answer(
+        "Выбери период по СРОКУ задачи (фильтр по due):",
+        reply_markup=admin_period_filter_keyboard(mode),
+    )
+    await callback.answer()
+
+
+def _admin_period_range(period: str) -> tuple[str, str]:
+    today = date.today()
+    if period == "day":
+        start = today - timedelta(days=1)
+        end = today
+    elif period == "week":
+        start = today - timedelta(days=7)
+        end = today
+    elif period == "month":
+        start = today - timedelta(days=30)
+        end = today
+    else:
+        start = today - timedelta(days=7)
+        end = today
+    return start.isoformat(), end.isoformat()
+
+
+def _due_in_range(due_iso: str, start_iso: str, end_iso: str) -> bool:
+    return bool(due_iso) and start_iso <= due_iso <= end_iso
+
+
+@router.callback_query(AdminTasksFSM.choosing_period, F.data.startswith("aperiod:"))
+async def admin_choose_period(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Только админам.")
+        await callback.answer()
+        return
+
+    _, view_mode, period = callback.data.split(":", 2)
+
+    if period == "other":
+        await state.set_state(AdminTasksFSM.entering_start)
+        await callback.message.answer("Введи дату НАЧАЛА (например 2026-02-01 или 01.02.2026):")
+        await callback.answer()
+        return
+
+    start_iso, end_iso = _admin_period_range(period)
+    await admin_show_tasks_filtered(callback.message, state, start_iso, end_iso)
+
+    await state.set_state(AdminTasksFSM.choosing_view)
+    await callback.answer()
+
+
+@router.message(AdminTasksFSM.entering_start)
+async def admin_period_start(message: Message, state: FSMContext):
+    if await deny_if_not_allowed(message):
+        return
+    if await deny_if_not_admin(message):
+        return
+
+    raw = (message.text or "").strip()
+    try:
+        start_iso = normalize_due_date(raw)
+    except Exception:
+        await send_with_menu(message, "Не понял дату начала. Пример: 2026-02-01 или 01.02.2026.")
+        return
+
+    await state.update_data(admin_filter_start=start_iso)
+    await state.set_state(AdminTasksFSM.entering_end)
+    await send_with_menu(message, "Теперь введи дату КОНЦА (например 2026-02-10 или 10.02.2026):")
+
+
+@router.message(AdminTasksFSM.entering_end)
+async def admin_period_end(message: Message, state: FSMContext):
+    if await deny_if_not_allowed(message):
+        return
+    if await deny_if_not_admin(message):
+        return
+
+    data = await state.get_data()
+    start_iso = data.get("admin_filter_start")
+    raw = (message.text or "").strip()
+
+    try:
+        end_iso = normalize_due_date(raw)
+    except Exception:
+        await send_with_menu(message, "Не понял дату конца. Пример: 2026-02-10 или 10.02.2026.")
+        return
+
+    if not start_iso:
+        await send_with_menu(message, "Ошибка: нет даты начала. Нажми 🛠 Админ: задачи заново.")
+        await state.clear()
+        return
+
+    if end_iso < start_iso:
+        await send_with_menu(message, f"Дата конца меньше даты начала ({start_iso}). Введи дату конца ещё раз.")
+        return
+
+    await admin_show_tasks_filtered(message, state, start_iso, end_iso)
+    await state.set_state(AdminTasksFSM.choosing_view)
+
+
+async def admin_show_tasks_filtered(message: Message, state: FSMContext, start_iso: str, end_iso: str):
+    data = await state.get_data()
+    sheet = data.get("admin_sheet")
+    mode = data.get("admin_view_mode")
+    if not sheet or not mode:
+        await send_with_menu(message, "Ошибка состояния админ-фильтра. Нажми 🛠 Админ: задачи заново.")
+        await state.clear()
+        return
+
+    all_tasks = await tasks_list(sheet)
+
+    if mode == "my":
+        tasks = [t for t in all_tasks if t.status != STATUS_DONE and _due_in_range(t.due_str, start_iso, end_iso)]
+    elif mode == "overdue":
+        tasks = [t for t in all_tasks if t.status != STATUS_DONE and t.due_str and is_overdue(t.due_str) and _due_in_range(t.due_str, start_iso, end_iso)]
+    elif mode == "done":
+        tasks = [t for t in all_tasks if t.status == STATUS_DONE and _due_in_range(t.due_str, start_iso, end_iso)]
+    else:
+        tasks = [t for t in all_tasks if _due_in_range(t.due_str, start_iso, end_iso)]
+
+    if not tasks:
+        await send_with_menu(message, f"Нет задач за период по сроку: {start_iso} — {end_iso}.")
+        return
+
+    await send_with_menu(message, f"Админ просмотр: {sheet}\nРежим: {mode}\nПериод по сроку: {start_iso} — {end_iso}")
+
+    for t in tasks:
+        line = format_task_line(t.task_id, t.task, t.from_name, t.due_str, t.status, is_common=(sheet == COMMON_SHEET))
+        await message.answer(line, reply_markup=admin_task_actions_keyboard(sheet, t.task_id, t.status))
+
 
 async def deny_cb_if_not_allowed(callback: CallbackQuery) -> bool:
     if not is_allowed(callback.from_user.id):
@@ -107,11 +305,20 @@ async def deny_if_not_admin(message: Message) -> bool:
         return True
     return False
 
+async def send_with_menu(message: Message, text: str):
+    """
+    Всегда отвечаем с главным меню снизу, чтобы кнопки не пропадали.
+    """
+    await message.answer(
+        text,
+        reply_markup=main_menu_keyboard(is_admin(message.from_user.id)),
+    )
+
 
 # ---------- misc helpers ----------
 
-def uuid_short() -> str:
-    return uuid.uuid4().hex[:8]
+#def uuid_short() -> str:
+#    return uuid.uuid4().hex[:8]
 
 
 def get_my_sheet_name_or_none(telegram_id: int, users_map: dict[str, int]) -> Optional[str]:
@@ -404,17 +611,19 @@ async def create_task_and_notify(message: Message, state: FSMContext, bot: Bot, 
     task_text = data["task_text"]
     from_name = data.get("from_name", "Unknown")
 
-    task_id = uuid_short()
     created_at = now_iso()
 
     row = TaskRow(
-        task_id=task_id,
+        task_id="",  # ✅ пусто => tasks.py сам назначит порядковый номер
         task=task_text,
         from_name=from_name,
         due_str=due_iso,
         status=STATUS_TODO,
         created_at=created_at,
     )
+
+    task_id = await task_append(assignee, row)  # ✅ получили номер
+    row.task_id = task_id
 
     await task_append(assignee, row)
 
@@ -784,6 +993,27 @@ async def cb_done_common(callback: CallbackQuery):
     await callback.message.answer(f"Готово ✅ Общая задача [{task_id}] отмечена DONE для {my_name}.")
     await callback.answer()
 
+
+#ЧЕПУХА
+MENU_BUTTONS = {
+    "➕ Новая задача",
+    "📋 Мои задачи",
+    "⏰ Просроченные",
+    "✅ Выполненные",
+    "📦 Все",
+    "🧾 Помощь",
+    "👥 Регистрации",
+    "🛠 Админ: задачи",
+}
+
+@router.message(F.text)
+async def catch_any_text_show_menu(message: Message):
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        return
+    if text in MENU_BUTTONS or text.startswith("🛠"):
+        return
+    await send_with_menu(message, "Не понял 🙂 Выбери действие в меню 👇")
 
 def build_dispatcher() -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
