@@ -3,34 +3,38 @@
 # - whitelist пользователей + админы
 # - регистрация /register (запрет повторной регистрации)
 # - админ-команды /registrations и /unregister <ID|Name>
-# - главное меню кнопками
-# - создание задач через диалог с кнопками срока
-# - просмотр задач (/my /overdue /done /all)
+# - главное меню кнопками (постоянное)
+# - создание задач через диалог (с кнопками срока + назад)
+# - просмотр задач (/my /overdue /done /all) без период-фильтров
 # - /team_overdue
 # - DONE для личных и общих задач
+# - админ: просмотр задач пользователей + редакт/удалить/переключить статус (без подтверждений)
+# - ARCHIVE скрывается из /my /overdue /all (показывается только если захотите отдельно)
 
 from __future__ import annotations
-from datetime import date, timedelta
+
+from datetime import date
 from typing import Optional, Tuple, List
-#import uuid
 
 from aiogram import Dispatcher, Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from taskbot.tg.fsm import NewTaskFSM, TasksFilterFSM, AdminTasksFSM
+
+from taskbot.tg.fsm import NewTaskFSM, AdminTasksFSM
 from taskbot.tg.keyboards import (
     assignee_keyboard,
     due_date_keyboard,
+    newtask_back_to_assignee_keyboard,
+    newtask_back_from_manual_due_keyboard,
     done_personal_keyboard,
     done_common_keyboard,
     main_menu_keyboard,
-    period_filter_keyboard,
-    admin_users_keyboard,          # ✅
-    admin_view_keyboard,           # ✅
-    admin_task_actions_keyboard,   # ✅
-    admin_period_filter_keyboard,
+    admin_users_keyboard,
+    admin_view_keyboard,
+    admin_task_actions_keyboard,
+    admin_nav_keyboard,
 )
 
 from taskbot.sheets.users import (
@@ -48,14 +52,12 @@ from taskbot.sheets.tasks import (
     task_append,
     tasks_list,
     task_set_done,
-    task_set_todo,
     task_set_status,
     task_update_text,
     task_update_due,
     task_delete,
     now_iso,
 )
-
 
 from taskbot.sheets.common import (
     common_tasks_for_user,
@@ -79,6 +81,7 @@ from taskbot.config import (
     COMMON_SHEET,
     STATUS_TODO,
     STATUS_DONE,
+    STATUS_ARCHIVE,
     ALLOWED_TELEGRAM_IDS,
     ADMIN_TELEGRAM_IDS,
 )
@@ -102,194 +105,6 @@ async def deny_if_not_allowed(message: Message) -> bool:
         return True
     return False
 
-@router.message(F.text.startswith("🛠"))
-async def btn_admin_tasks(message: Message, state: FSMContext):
-    if await deny_if_not_allowed(message):
-        return
-    if await deny_if_not_admin(message):
-        return
-
-    users_map = await users_get_map()
-    await state.update_data(admin_users=list(users_map.keys()))
-    await state.set_state(AdminTasksFSM.choosing_user)
-
-    await message.answer(
-        "Выбери пользователя для просмотра задач:",
-        reply_markup=admin_users_keyboard(list(users_map.keys())),
-    )
-
-
-@router.callback_query(AdminTasksFSM.choosing_user, F.data.startswith("admin_user:"))
-async def admin_pick_user(callback: CallbackQuery, state: FSMContext):
-    if await deny_cb_if_not_allowed(callback):
-        return
-    if not is_admin(callback.from_user.id):
-        await callback.message.answer("⛔ Только админам.")
-        await callback.answer()
-        return
-
-    sheet = callback.data.split(":", 1)[1].strip()
-    await state.update_data(admin_sheet=sheet)
-    await state.set_state(AdminTasksFSM.choosing_view)
-
-    await callback.message.answer(
-        f"Ок. Выбран лист: {sheet}\nВыбери режим просмотра:",
-        reply_markup=admin_view_keyboard(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(AdminTasksFSM.choosing_view, F.data.startswith("admin_view:"))
-async def admin_pick_view(callback: CallbackQuery, state: FSMContext):
-    if await deny_cb_if_not_allowed(callback):
-        return
-    if not is_admin(callback.from_user.id):
-        await callback.message.answer("⛔ Только админам.")
-        await callback.answer()
-        return
-
-    mode = callback.data.split(":", 1)[1].strip()  # my/overdue/done/all
-    data = await state.get_data()
-    sheet = data.get("admin_sheet")
-    if not sheet:
-        await callback.message.answer("Не выбран пользователь. Нажми 🛠 Админ: задачи ещё раз.")
-        await callback.answer()
-        return
-
-    await state.update_data(admin_view_mode=mode)
-    await state.set_state(AdminTasksFSM.choosing_period)
-
-    await callback.message.answer(
-        "Выбери период по СРОКУ задачи (фильтр по due):",
-        reply_markup=admin_period_filter_keyboard(mode),
-    )
-    await callback.answer()
-
-
-def _admin_period_range(period: str) -> tuple[str, str]:
-    today = date.today()
-    if period == "day":
-        start = today - timedelta(days=1)
-        end = today
-    elif period == "week":
-        start = today - timedelta(days=7)
-        end = today
-    elif period == "month":
-        start = today - timedelta(days=30)
-        end = today
-    else:
-        start = today - timedelta(days=7)
-        end = today
-    return start.isoformat(), end.isoformat()
-
-
-def _due_in_range(due_iso: str, start_iso: str, end_iso: str) -> bool:
-    return bool(due_iso) and start_iso <= due_iso <= end_iso
-
-
-@router.callback_query(AdminTasksFSM.choosing_period, F.data.startswith("aperiod:"))
-async def admin_choose_period(callback: CallbackQuery, state: FSMContext):
-    if await deny_cb_if_not_allowed(callback):
-        return
-    if not is_admin(callback.from_user.id):
-        await callback.message.answer("⛔ Только админам.")
-        await callback.answer()
-        return
-
-    _, view_mode, period = callback.data.split(":", 2)
-
-    if period == "other":
-        await state.set_state(AdminTasksFSM.entering_start)
-        await callback.message.answer("Введи дату НАЧАЛА (например 2026-02-01 или 01.02.2026):")
-        await callback.answer()
-        return
-
-    start_iso, end_iso = _admin_period_range(period)
-    await admin_show_tasks_filtered(callback.message, state, start_iso, end_iso)
-
-    await state.set_state(AdminTasksFSM.choosing_view)
-    await callback.answer()
-
-
-@router.message(AdminTasksFSM.entering_start)
-async def admin_period_start(message: Message, state: FSMContext):
-    if await deny_if_not_allowed(message):
-        return
-    if await deny_if_not_admin(message):
-        return
-
-    raw = (message.text or "").strip()
-    try:
-        start_iso = normalize_due_date(raw)
-    except Exception:
-        await send_with_menu(message, "Не понял дату начала. Пример: 2026-02-01 или 01.02.2026.")
-        return
-
-    await state.update_data(admin_filter_start=start_iso)
-    await state.set_state(AdminTasksFSM.entering_end)
-    await send_with_menu(message, "Теперь введи дату КОНЦА (например 2026-02-10 или 10.02.2026):")
-
-
-@router.message(AdminTasksFSM.entering_end)
-async def admin_period_end(message: Message, state: FSMContext):
-    if await deny_if_not_allowed(message):
-        return
-    if await deny_if_not_admin(message):
-        return
-
-    data = await state.get_data()
-    start_iso = data.get("admin_filter_start")
-    raw = (message.text or "").strip()
-
-    try:
-        end_iso = normalize_due_date(raw)
-    except Exception:
-        await send_with_menu(message, "Не понял дату конца. Пример: 2026-02-10 или 10.02.2026.")
-        return
-
-    if not start_iso:
-        await send_with_menu(message, "Ошибка: нет даты начала. Нажми 🛠 Админ: задачи заново.")
-        await state.clear()
-        return
-
-    if end_iso < start_iso:
-        await send_with_menu(message, f"Дата конца меньше даты начала ({start_iso}). Введи дату конца ещё раз.")
-        return
-
-    await admin_show_tasks_filtered(message, state, start_iso, end_iso)
-    await state.set_state(AdminTasksFSM.choosing_view)
-
-
-async def admin_show_tasks_filtered(message: Message, state: FSMContext, start_iso: str, end_iso: str):
-    data = await state.get_data()
-    sheet = data.get("admin_sheet")
-    mode = data.get("admin_view_mode")
-    if not sheet or not mode:
-        await send_with_menu(message, "Ошибка состояния админ-фильтра. Нажми 🛠 Админ: задачи заново.")
-        await state.clear()
-        return
-
-    all_tasks = await tasks_list(sheet)
-
-    if mode == "my":
-        tasks = [t for t in all_tasks if t.status != STATUS_DONE and _due_in_range(t.due_str, start_iso, end_iso)]
-    elif mode == "overdue":
-        tasks = [t for t in all_tasks if t.status != STATUS_DONE and t.due_str and is_overdue(t.due_str) and _due_in_range(t.due_str, start_iso, end_iso)]
-    elif mode == "done":
-        tasks = [t for t in all_tasks if t.status == STATUS_DONE and _due_in_range(t.due_str, start_iso, end_iso)]
-    else:
-        tasks = [t for t in all_tasks if _due_in_range(t.due_str, start_iso, end_iso)]
-
-    if not tasks:
-        await send_with_menu(message, f"Нет задач за период по сроку: {start_iso} — {end_iso}.")
-        return
-
-    await send_with_menu(message, f"Админ просмотр: {sheet}\nРежим: {mode}\nПериод по сроку: {start_iso} — {end_iso}")
-
-    for t in tasks:
-        line = format_task_line(t.task_id, t.task, t.from_name, t.due_str, t.status, is_common=(sheet == COMMON_SHEET))
-        await message.answer(line, reply_markup=admin_task_actions_keyboard(sheet, t.task_id, t.status))
-
 
 async def deny_cb_if_not_allowed(callback: CallbackQuery) -> bool:
     if not is_allowed(callback.from_user.id):
@@ -305,6 +120,7 @@ async def deny_if_not_admin(message: Message) -> bool:
         return True
     return False
 
+
 async def send_with_menu(message: Message, text: str):
     """
     Всегда отвечаем с главным меню снизу, чтобы кнопки не пропадали.
@@ -316,10 +132,6 @@ async def send_with_menu(message: Message, text: str):
 
 
 # ---------- misc helpers ----------
-
-#def uuid_short() -> str:
-#    return uuid.uuid4().hex[:8]
-
 
 def get_my_sheet_name_or_none(telegram_id: int, users_map: dict[str, int]) -> Optional[str]:
     for name, tid in users_map.items():
@@ -335,41 +147,6 @@ def _parse_unregister_target(arg: str) -> Tuple[Optional[int], Optional[str]]:
     if arg.isdigit():
         return int(arg), None
     return None, arg
-
-def _period_range(period: str) -> tuple[str, str]:
-    """
-    Возвращает (start_iso, end_iso) по пресету.
-    Считаем от today, но фильтруем ПО DUE ДАТЕ.
-    overdue: будем показывать задачи, у которых due попадает в этот диапазон.
-    done: аналогично.
-    """
-    today = date.today()
-
-    if period == "day":
-        start = today - timedelta(days=1)
-        end = today
-    elif period == "week":
-        start = today - timedelta(days=7)
-        end = today
-    elif period == "month":
-        start = today - timedelta(days=30)
-        end = today
-    else:
-        # fallback, но вообще сюда не должны попасть
-        start = today - timedelta(days=7)
-        end = today
-
-    return start.isoformat(), end.isoformat()
-
-
-def _in_due_range(due_iso: str, start_iso: str, end_iso: str) -> bool:
-    """
-    Проверка что due находится в диапазоне включительно.
-    """
-    if not due_iso:
-        return False
-    return start_iso <= due_iso <= end_iso
-
 
 
 # ---------- commands ----------
@@ -391,34 +168,34 @@ async def cmd_register(message: Message):
         return
 
     telegram_id = message.from_user.id
-
     parts = (message.text or "").split(maxsplit=1)
+
     if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Использование: /register <ИмяВкладки>\nНапример: /register Иван")
+        await send_with_menu(message, "Использование: /register <ИмяВкладки>\nНапример: /register Иван")
         return
 
     sheet_name = parts[1].strip()
 
     existing_name = await users_get_by_telegram_id(telegram_id)
     if existing_name is not None:
-        await message.answer(
+        await send_with_menu(
+            message,
             f"⛔ Ты уже зарегистрирован как '{existing_name}'.\n"
             f"Повторная регистрация запрещена.\n"
-            f"Если нужно изменить регистрацию — попроси админа удалить её."
+            f"Если нужно изменить регистрацию — попроси админа удалить её.",
         )
         return
 
     existing_tid = await users_get_by_name(sheet_name)
     if existing_tid is not None and existing_tid != telegram_id:
-        await message.answer(f"⛔ Имя '{sheet_name}' уже занято другим пользователем. Выбери другое.")
+        await send_with_menu(message, f"⛔ Имя '{sheet_name}' уже занято другим пользователем. Выбери другое.")
         return
 
     await users_upsert(sheet_name, telegram_id)
 
-    await message.answer(
-        f"Готово ✅ Ты зарегистрирован как '{sheet_name}'.\n"
-        f"Теперь можно работать через меню 👇",
-        reply_markup=main_menu_keyboard(is_admin(message.from_user.id)),
+    await send_with_menu(
+        message,
+        f"Готово ✅ Ты зарегистрирован как '{sheet_name}'.\nТеперь можно работать через меню 👇",
     )
 
 
@@ -431,12 +208,12 @@ async def cmd_registrations(message: Message):
 
     regs = await users_list()
     if not regs:
-        await message.answer("Регистраций нет.")
+        await send_with_menu(message, "Регистраций нет.")
         return
 
     lines = [f"• {name} — {tid}" for name, tid in sorted(regs, key=lambda x: (x[0].lower(), x[1]))]
     for part in chunk_text(lines):
-        await message.answer(part)
+        await send_with_menu(message, part)
 
 
 @router.message(Command("unregister"))
@@ -448,7 +225,7 @@ async def cmd_unregister(message: Message):
 
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Использование: /unregister <TelegramID|Name>\nПример: /unregister 123456789 или /unregister Иван")
+        await send_with_menu(message, "Использование: /unregister <TelegramID|Name>\nПример: /unregister 123456789 или /unregister Иван")
         return
 
     telegram_id, name = _parse_unregister_target(parts[1])
@@ -456,20 +233,20 @@ async def cmd_unregister(message: Message):
     if telegram_id is not None:
         deleted_name = await users_delete_by_telegram_id(telegram_id)
         if deleted_name is None:
-            await message.answer("Не нашёл регистрацию по этому TelegramID.")
+            await send_with_menu(message, "Не нашёл регистрацию по этому TelegramID.")
             return
-        await message.answer(f"Готово ✅ Удалил регистрацию: {deleted_name} — {telegram_id}")
+        await send_with_menu(message, f"Готово ✅ Удалил регистрацию: {deleted_name} — {telegram_id}")
         return
 
     if name is not None:
         deleted_tid = await users_delete_by_name(name)
         if deleted_tid is None:
-            await message.answer("Не нашёл регистрацию по этому имени.")
+            await send_with_menu(message, "Не нашёл регистрацию по этому имени.")
             return
-        await message.answer(f"Готово ✅ Удалил регистрацию: {name} — {deleted_tid}")
+        await send_with_menu(message, f"Готово ✅ Удалил регистрацию: {name} — {deleted_tid}")
         return
 
-    await message.answer("Не понял, кого удалять. Пример: /unregister 123456789 или /unregister Иван")
+    await send_with_menu(message, "Не понял, кого удалять. Пример: /unregister 123456789 или /unregister Иван")
 
 
 @router.message(Command("newtask"))
@@ -478,16 +255,109 @@ async def cmd_newtask(message: Message, state: FSMContext):
         return
 
     users_map = await users_get_map()
-
     my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
+
     if not my_sheet:
-        await message.answer("Ты не зарегистрирован. Сначала сделай: /register <ИмяВкладки>")
+        await send_with_menu(message, "Ты не зарегистрирован. Сначала сделай: /register <ИмяВкладки>")
         return
 
     await state.update_data(from_name=message.from_user.full_name)
     await state.set_state(NewTaskFSM.choosing_assignee)
 
     await message.answer("Кому поставить задачу?", reply_markup=assignee_keyboard(list(users_map.keys())))
+
+
+@router.message(Command("my"))
+async def cmd_my(message: Message):
+    if await deny_if_not_allowed(message):
+        return
+
+    users_map = await users_get_map()
+    my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
+    if not my_sheet:
+        await send_with_menu(message, "Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
+        return
+
+    await show_tasks(message, my_sheet, "my")
+
+
+@router.message(Command("overdue"))
+async def cmd_overdue(message: Message):
+    if await deny_if_not_allowed(message):
+        return
+
+    users_map = await users_get_map()
+    my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
+    if not my_sheet:
+        await send_with_menu(message, "Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
+        return
+
+    await show_tasks(message, my_sheet, "overdue")
+
+
+@router.message(Command("done"))
+async def cmd_done(message: Message):
+    if await deny_if_not_allowed(message):
+        return
+
+    users_map = await users_get_map()
+    my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
+    if not my_sheet:
+        await send_with_menu(message, "Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
+        return
+
+    await show_tasks(message, my_sheet, "done")
+
+
+@router.message(Command("all"))
+async def cmd_all(message: Message):
+    if await deny_if_not_allowed(message):
+        return
+
+    users_map = await users_get_map()
+    my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
+    if not my_sheet:
+        await send_with_menu(message, "Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
+        return
+
+    await show_tasks(message, my_sheet, "all")
+
+
+@router.message(Command("team_overdue"))
+async def cmd_team_overdue(message: Message):
+    if await deny_if_not_allowed(message):
+        return
+
+    users_map = await users_get_map()
+    if not users_map:
+        await send_with_menu(message, "В Users нет регистраций.")
+        return
+
+    out: List[str] = []
+
+    for name in sorted(users_map.keys()):
+        personal = await tasks_list(name)
+        personal_overdue = [
+            t for t in personal
+            if t.status not in (STATUS_DONE, STATUS_ARCHIVE) and t.due_str and is_overdue(t.due_str)
+        ]
+
+        common_overdue = await common_tasks_for_user(name, "overdue")
+
+        if personal_overdue or common_overdue:
+            out.append(f"== {name} ==")
+            for t in personal_overdue:
+                out.append(format_task_line(t.task_id, t.task, t.from_name, t.due_str, t.status, is_common=False))
+            for t in common_overdue:
+                out.append(format_task_line(t.task_id, t.task, t.from_name, t.due_str, t.status, is_common=True))
+            out.append("")
+
+    if not out:
+        await send_with_menu(message, "Просроченных задач по команде нет 🎉")
+        return
+
+    for part in chunk_text(out):
+        await send_with_menu(message, part)
 
 
 # ---------- menu buttons (reply keyboard) ----------
@@ -503,14 +373,13 @@ async def btn_my(message: Message):
 
 
 @router.message(F.text == "⏰ Просроченные")
-async def btn_overdue(message: Message, state: FSMContext):
-    await cmd_overdue(message, state)
+async def btn_overdue(message: Message):
+    await cmd_overdue(message)
 
 
 @router.message(F.text == "✅ Выполненные")
-async def btn_done(message: Message, state: FSMContext):
-    await cmd_done(message, state)
-
+async def btn_done(message: Message):
+    await cmd_done(message)
 
 
 @router.message(F.text == "📦 Все")
@@ -528,6 +397,22 @@ async def btn_registrations(message: Message):
     await cmd_registrations(message)
 
 
+@router.message(F.text.startswith("🛠"))
+async def btn_admin_tasks(message: Message, state: FSMContext):
+    if await deny_if_not_allowed(message):
+        return
+    if await deny_if_not_admin(message):
+        return
+
+    users_map = await users_get_map()
+    await state.set_state(AdminTasksFSM.choosing_user)
+
+    await message.answer(
+        "Выбери пользователя для просмотра задач:",
+        reply_markup=admin_users_keyboard(list(users_map.keys())),
+    )
+
+
 # ---------- FSM: create task ----------
 
 @router.callback_query(NewTaskFSM.choosing_assignee, F.data.startswith("assignee:"))
@@ -536,11 +421,33 @@ async def pick_assignee(callback: CallbackQuery, state: FSMContext):
         return
 
     assignee = callback.data.split(":", 1)[1].strip()
-
     await state.update_data(assignee=assignee)
     await state.set_state(NewTaskFSM.entering_task_text)
 
-    await callback.message.answer(f"Ок. Напиши текст задачи для: {assignee}")
+    await callback.message.answer(
+        f"Ок. Напиши текст задачи для: {assignee}",
+        reply_markup=newtask_back_to_assignee_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "newtask_cancel")
+async def newtask_cancel(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    await state.clear()
+    await send_with_menu(callback.message, "Ок, отменил создание задачи. Выбери действие 👇")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "newtask_back:assignee")
+async def newtask_back_to_assignee(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+
+    users_map = await users_get_map()
+    await state.set_state(NewTaskFSM.choosing_assignee)
+    await callback.message.answer("Кому поставить задачу?", reply_markup=assignee_keyboard(list(users_map.keys())))
     await callback.answer()
 
 
@@ -551,13 +458,22 @@ async def enter_task_text(message: Message, state: FSMContext):
 
     task_text = (message.text or "").strip()
     if not task_text:
-        await message.answer("Текст задачи пустой. Напиши ещё раз.")
+        await send_with_menu(message, "Текст задачи пустой. Напиши ещё раз.")
         return
 
     await state.update_data(task_text=task_text)
     await state.set_state(NewTaskFSM.choosing_due_preset)
 
     await message.answer("Выбери срок задачи:", reply_markup=due_date_keyboard())
+
+
+@router.callback_query(NewTaskFSM.choosing_due_preset, F.data == "newtask_back:text")
+async def newtask_back_to_text(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    await state.set_state(NewTaskFSM.entering_task_text)
+    await callback.message.answer("Ок, введи текст задачи заново:", reply_markup=newtask_back_to_assignee_keyboard())
+    await callback.answer()
 
 
 @router.callback_query(NewTaskFSM.choosing_due_preset, F.data.startswith("due:"))
@@ -569,7 +485,10 @@ async def pick_due_preset(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
     if preset == "other":
         await state.set_state(NewTaskFSM.entering_due_date_manual)
-        await callback.message.answer("Введи срок (например 2026-02-05 или 05.02.2026).")
+        await callback.message.answer(
+            "Введи срок (например 2026-02-05 или 05.02.2026).",
+            reply_markup=newtask_back_from_manual_due_keyboard(),
+        )
         await callback.answer()
         return
 
@@ -588,17 +507,25 @@ async def pick_due_preset(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await callback.answer()
 
 
+@router.callback_query(NewTaskFSM.entering_due_date_manual, F.data == "newtask_back:due")
+async def newtask_back_from_manual_due(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    await state.set_state(NewTaskFSM.choosing_due_preset)
+    await callback.message.answer("Выбери срок задачи:", reply_markup=due_date_keyboard())
+    await callback.answer()
+
+
 @router.message(NewTaskFSM.entering_due_date_manual)
 async def enter_due_date_manual(message: Message, state: FSMContext, bot: Bot):
     if await deny_if_not_allowed(message):
         return
 
     raw_due = (message.text or "").strip()
-
     try:
         due_iso = normalize_due_date(raw_due)
     except Exception:
-        await message.answer("Не смог распознать дату. Пример: 2026-02-05 или 05.02.2026. Попробуй ещё раз.")
+        await send_with_menu(message, "Не смог распознать дату. Пример: 2026-02-05 или 05.02.2026. Попробуй ещё раз.")
         return
 
     await create_task_and_notify(message, state, bot, due_iso)
@@ -614,7 +541,7 @@ async def create_task_and_notify(message: Message, state: FSMContext, bot: Bot, 
     created_at = now_iso()
 
     row = TaskRow(
-        task_id="",  # ✅ пусто => tasks.py сам назначит порядковый номер
+        task_id="",  # tasks.py назначит порядковый номер
         task=task_text,
         from_name=from_name,
         due_str=due_iso,
@@ -622,7 +549,7 @@ async def create_task_and_notify(message: Message, state: FSMContext, bot: Bot, 
         created_at=created_at,
     )
 
-    task_id = await task_append(assignee, row)  # ✅ получили номер
+    task_id = await task_append(assignee, row)  # ВАЖНО: только 1 раз!
     row.task_id = task_id
 
     if assignee != COMMON_SHEET:
@@ -638,7 +565,8 @@ async def create_task_and_notify(message: Message, state: FSMContext, bot: Bot, 
             except Exception:
                 pass
 
-    await message.answer(
+    await send_with_menu(
+        message,
         "Готово ✅ Задача создана.\n\n"
         + format_task_line(
             row.task_id,
@@ -647,32 +575,42 @@ async def create_task_and_notify(message: Message, state: FSMContext, bot: Bot, 
             row.due_str,
             row.status,
             is_common=(assignee == COMMON_SHEET),
-        )
+        ),
     )
 
     await state.clear()
 
 
-# ---------- tasks view ----------
+# ---------- tasks view (no filters) ----------
 
 async def show_tasks(message: Message, my_sheet_name: str, mode: str):
     personal = await tasks_list(my_sheet_name)
 
     if mode == "my":
-        personal = [t for t in personal if t.status != STATUS_DONE]
+        personal = [t for t in personal if t.status not in (STATUS_DONE, STATUS_ARCHIVE)]
     elif mode == "overdue":
-        personal = [t for t in personal if t.status != STATUS_DONE and t.due_str and is_overdue(t.due_str)]
+        personal = [t for t in personal if t.status not in (STATUS_DONE, STATUS_ARCHIVE) and t.due_str and is_overdue(t.due_str)]
     elif mode == "done":
         personal = [t for t in personal if t.status == STATUS_DONE]
+    elif mode == "all":
+        personal = [t for t in personal if t.status != STATUS_ARCHIVE]
 
     common = await common_tasks_for_user(my_sheet_name, mode)
+
+    # если common модуль когда-то начнёт отдавать ARCHIVE — на всякий случай фильтруем:
+    if mode in ("my", "overdue", "all"):
+        common = [t for t in common if t.status != STATUS_ARCHIVE]
+    if mode == "my":
+        common = [t for t in common if t.status != STATUS_DONE]
+    if mode == "done":
+        common = [t for t in common if t.status == STATUS_DONE]
 
     combined: List[Tuple[TaskRow, bool]] = []
     combined += [(t, False) for t in personal]
     combined += [(t, True) for t in common]
 
     if not combined:
-        await message.answer("Нет задач по выбранному фильтру.")
+        await send_with_menu(message, "Нет задач по выбранному списку.")
         return
 
     def sort_key(item: Tuple[TaskRow, bool]):
@@ -689,75 +627,11 @@ async def show_tasks(message: Message, my_sheet_name: str, mode: str):
     ]
 
     for part in chunk_text(lines):
-        await message.answer(part)
-
-    for (t, is_common) in combined:
-        if t.status == STATUS_DONE:
-            continue
-        if is_common:
-            await message.answer(f"Отметить выполненной ОБЩУЮ задачу [{t.task_id}]?", reply_markup=done_common_keyboard(t.task_id))
-        else:
-            await message.answer(f"Отметить выполненной задачу [{t.task_id}]?", reply_markup=done_personal_keyboard(my_sheet_name, t.task_id))
-
-
-async def show_tasks_filtered(message: Message, my_sheet_name: str, mode: str, start_iso: str, end_iso: str):
-    """
-    Показываем задачи по фильтру периода (ПО DUE ДАТЕ).
-    mode: overdue или done
-    start_iso/end_iso: включительно
-    """
-    personal = await tasks_list(my_sheet_name)
-
-    if mode == "overdue":
-        personal = [
-            t for t in personal
-            if t.status != STATUS_DONE
-            and t.due_str
-            and is_overdue(t.due_str)                 # просрочено
-            and _in_due_range(t.due_str, start_iso, end_iso)  # и в диапазоне по due
-        ]
-    elif mode == "done":
-        personal = [
-            t for t in personal
-            if t.status == STATUS_DONE
-            and t.due_str
-            and _in_due_range(t.due_str, start_iso, end_iso)
-        ]
-    else:
-        await send_with_menu(message, "Неизвестный режим фильтра.")
-        return
-
-    # общие задачи тоже фильтруем по due
-    common = await common_tasks_for_user(my_sheet_name, mode)
-    common = [t for t in common if t.due_str and _in_due_range(t.due_str, start_iso, end_iso)]
-
-    combined: List[Tuple[TaskRow, bool]] = []
-    combined += [(t, False) for t in personal]
-    combined += [(t, True) for t in common]
-
-    if not combined:
-        await send_with_menu(message, f"Нет задач за период {start_iso} — {end_iso}.")
-        return
-
-    def sort_key(item: Tuple[TaskRow, bool]):
-        t, _ = item
-        due_val = t.due_str or "9999-12-31"
-        return due_val
-
-    combined.sort(key=sort_key)
-
-    lines = [
-        f"Период по сроку: {start_iso} — {end_iso}\n"
-    ] + [
-        format_task_line(t.task_id, t.task, t.from_name, t.due_str, t.status, is_common=is_common)
-        for (t, is_common) in combined
-    ]
-
-    for part in chunk_text(lines):
         await send_with_menu(message, part)
 
-    # DONE-кнопки показываем только для overdue (чтобы можно было быстро закрывать)
-    if mode == "overdue":
+    # DONE-кнопки показываем только там, где есть смысл:
+    # - my и overdue: можно закрывать
+    if mode in ("my", "overdue"):
         for (t, is_common) in combined:
             if t.status == STATUS_DONE:
                 continue
@@ -765,192 +639,6 @@ async def show_tasks_filtered(message: Message, my_sheet_name: str, mode: str, s
                 await message.answer(f"Отметить выполненной ОБЩУЮ задачу [{t.task_id}]?", reply_markup=done_common_keyboard(t.task_id))
             else:
                 await message.answer(f"Отметить выполненной задачу [{t.task_id}]?", reply_markup=done_personal_keyboard(my_sheet_name, t.task_id))
-
-
-@router.callback_query(TasksFilterFSM.choosing_period, F.data.startswith("period:"))
-async def cb_choose_period(callback: CallbackQuery, state: FSMContext):
-    if await deny_cb_if_not_allowed(callback):
-        return
-
-    _, mode, period = callback.data.split(":", 2)
-
-    data = await state.get_data()
-    sheet = data.get("filter_sheet")
-
-    if not sheet:
-        await callback.message.answer("Ошибка: не найден пользователь. Открой /done или /overdue заново.")
-        await state.clear()
-        await callback.answer()
-        return
-
-    if period == "other":
-        await state.update_data(filter_mode=mode)
-        await state.set_state(TasksFilterFSM.entering_start)
-        await callback.message.answer("Введи дату НАЧАЛА (например 2026-02-01 или 01.02.2026):")
-        await callback.answer()
-        return
-
-    start_iso, end_iso = _period_range(period)
-
-    await show_tasks_filtered(callback.message, sheet, mode, start_iso, end_iso)
-
-    await state.clear()
-    await callback.answer()
-
-
-@router.message(TasksFilterFSM.entering_start)
-async def filter_enter_start(message: Message, state: FSMContext):
-    if await deny_if_not_allowed(message):
-        return
-
-    raw = (message.text or "").strip()
-    try:
-        start_iso = normalize_due_date(raw)
-    except Exception:
-        await send_with_menu(message, "Не понял дату начала. Пример: 2026-02-01 или 01.02.2026.")
-        return
-
-    await state.update_data(filter_start=start_iso)
-    await state.set_state(TasksFilterFSM.entering_end)
-
-    await send_with_menu(message, "Теперь введи дату КОНЦА (например 2026-02-10 или 10.02.2026):")
-
-
-@router.message(TasksFilterFSM.entering_end)
-async def filter_enter_end(message: Message, state: FSMContext):
-    if await deny_if_not_allowed(message):
-        return
-
-    data = await state.get_data()
-    sheet = data.get("filter_sheet")
-    mode = data.get("filter_mode")
-    start_iso = data.get("filter_start")
-
-    raw = (message.text or "").strip()
-    try:
-        end_iso = normalize_due_date(raw)
-    except Exception:
-        await send_with_menu(message, "Не понял дату конца. Пример: 2026-02-10 или 10.02.2026.")
-        return
-
-    if not sheet or not mode or not start_iso:
-        await send_with_menu(message, "Ошибка состояния фильтра. Открой /done или /overdue заново.")
-        await state.clear()
-        return
-
-    if end_iso < start_iso:
-        await send_with_menu(message, f"Дата конца меньше даты начала. Начало: {start_iso}, конец: {end_iso}. Введи конец ещё раз.")
-        return
-
-    await show_tasks_filtered(message, sheet, mode, start_iso, end_iso)
-
-    await state.clear()
-
-
-@router.message(Command("my"))
-async def cmd_my(message: Message):
-    if await deny_if_not_allowed(message):
-        return
-
-    users_map = await users_get_map()
-    my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
-
-    if not my_sheet:
-        await message.answer("Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
-        return
-
-    await show_tasks(message, my_sheet, "my")
-
-@router.message(Command("overdue"))
-async def cmd_overdue(message: Message, state: FSMContext):
-    if await deny_if_not_allowed(message):
-        return
-
-    users_map = await users_get_map()
-    my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
-
-    if not my_sheet:
-        await send_with_menu(message, "Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
-        return
-
-    # сохраняем контекст фильтра в FSM
-    await state.update_data(filter_mode="overdue", filter_sheet=my_sheet)
-    await state.set_state(TasksFilterFSM.choosing_period)
-
-    await message.answer(
-        "Выбери период по сроку задачи (считаем от даты СРОКА):",
-        reply_markup=period_filter_keyboard("overdue"),
-    )
-
-
-@router.message(Command("done"))
-async def cmd_done(message: Message, state: FSMContext):
-    if await deny_if_not_allowed(message):
-        return
-
-    users_map = await users_get_map()
-    my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
-
-    if not my_sheet:
-        await send_with_menu(message, "Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
-        return
-
-    await state.update_data(filter_mode="done", filter_sheet=my_sheet)
-    await state.set_state(TasksFilterFSM.choosing_period)
-
-    await message.answer(
-        "Выбери период по сроку задачи (считаем от даты СРОКА):",
-        reply_markup=period_filter_keyboard("done"),
-    )
-
-
-
-@router.message(Command("all"))
-async def cmd_all(message: Message):
-    if await deny_if_not_allowed(message):
-        return
-
-    users_map = await users_get_map()
-    my_sheet = get_my_sheet_name_or_none(message.from_user.id, users_map)
-
-    if not my_sheet:
-        await message.answer("Ты не зарегистрирован. Сделай: /register <ИмяВкладки>")
-        return
-
-    await show_tasks(message, my_sheet, "all")
-
-
-@router.message(Command("team_overdue"))
-async def cmd_team_overdue(message: Message):
-    if await deny_if_not_allowed(message):
-        return
-
-    users_map = await users_get_map()
-    if not users_map:
-        await message.answer("В Users нет регистраций.")
-        return
-
-    out: List[str] = []
-
-    for name in sorted(users_map.keys()):
-        personal = await tasks_list(name)
-        personal_overdue = [t for t in personal if t.status != STATUS_DONE and t.due_str and is_overdue(t.due_str)]
-        common_overdue = await common_tasks_for_user(name, "overdue")
-
-        if personal_overdue or common_overdue:
-            out.append(f"== {name} ==")
-            for t in personal_overdue:
-                out.append(format_task_line(t.task_id, t.task, t.from_name, t.due_str, t.status, is_common=False))
-            for t in common_overdue:
-                out.append(format_task_line(t.task_id, t.task, t.from_name, t.due_str, t.status, is_common=True))
-            out.append("")
-
-    if not out:
-        await message.answer("Просроченных задач по команде нет 🎉")
-        return
-
-    for part in chunk_text(out):
-        await message.answer(part)
 
 
 # ---------- DONE callbacks ----------
@@ -987,18 +675,134 @@ async def cb_done_common(callback: CallbackQuery):
         return
 
     await common_progress_set_done(task_id, my_name)
-
     await callback.message.answer(f"Готово ✅ Общая задача [{task_id}] отмечена DONE для {my_name}.")
     await callback.answer()
 
-# ---------- ADMIN: edit / delete / status callbacks ----------
+
+# ---------- ADMIN: navigation + view list (no filters) ----------
+
+@router.callback_query(F.data == "admin_back:exit")
+async def admin_back_exit(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    await state.clear()
+    await send_with_menu(callback.message, "Ок, вернулся в меню 👇")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_back:users")
+async def admin_back_users(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    users_map = await users_get_map()
+    await state.set_state(AdminTasksFSM.choosing_user)
+    await callback.message.answer("Выбери пользователя:", reply_markup=admin_users_keyboard(list(users_map.keys())))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_back:views")
+async def admin_back_views(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    sheet = data.get("admin_sheet")
+    if not sheet:
+        await admin_back_users(callback, state)
+        return
+
+    await state.set_state(AdminTasksFSM.choosing_view)
+    await callback.message.answer(f"Выбран лист: {sheet}\nВыбери режим просмотра:", reply_markup=admin_view_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(AdminTasksFSM.choosing_user, F.data.startswith("admin_user:"))
+async def admin_pick_user(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Только админам.")
+        await callback.answer()
+        return
+
+    sheet = callback.data.split(":", 1)[1].strip()
+    await state.update_data(admin_sheet=sheet)
+    await state.set_state(AdminTasksFSM.choosing_view)
+
+    await callback.message.answer(
+        f"Ок. Выбран лист: {sheet}\nВыбери режим просмотра:",
+        reply_markup=admin_view_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminTasksFSM.choosing_view, F.data.startswith("admin_view:"))
+async def admin_pick_view(callback: CallbackQuery, state: FSMContext):
+    if await deny_cb_if_not_allowed(callback):
+        return
+    if not is_admin(callback.from_user.id):
+        await callback.message.answer("⛔ Только админам.")
+        await callback.answer()
+        return
+
+    mode = callback.data.split(":", 1)[1].strip()  # my/overdue/done/all
+    data = await state.get_data()
+    sheet = data.get("admin_sheet")
+
+    if not sheet:
+        await callback.message.answer("Не выбран пользователь. Нажми 🛠 Админ: задачи ещё раз.")
+        await callback.answer()
+        return
+
+    await state.update_data(admin_view_mode=mode)
+
+    await admin_show_tasks(callback.message, sheet, mode)
+
+    await callback.message.answer("Навигация:", reply_markup=admin_nav_keyboard())
+    await callback.answer()
+
+
+async def admin_show_tasks(message: Message, sheet: str, mode: str):
+    """
+    Админ: показывает задачи конкретного листа без период-фильтров.
+    ARCHIVE скрываем в all/my/overdue, а done показывает только DONE.
+    """
+    all_tasks = await tasks_list(sheet)
+
+    if mode == "my":
+        tasks = [t for t in all_tasks if t.status not in (STATUS_DONE, STATUS_ARCHIVE)]
+    elif mode == "overdue":
+        tasks = [t for t in all_tasks if t.status not in (STATUS_DONE, STATUS_ARCHIVE) and t.due_str and is_overdue(t.due_str)]
+    elif mode == "done":
+        tasks = [t for t in all_tasks if t.status == STATUS_DONE]
+    else:
+        tasks = [t for t in all_tasks if t.status != STATUS_ARCHIVE]
+
+    if not tasks:
+        await send_with_menu(message, f"Админ просмотр: {sheet}\nРежим: {mode}\nНет задач.")
+        return
+
+    await send_with_menu(message, f"Админ просмотр: {sheet}\nРежим: {mode}\nЗадач: {len(tasks)}")
+
+    # сортировка по due
+    tasks.sort(key=lambda t: (t.due_str or "9999-12-31"))
+
+    for t in tasks:
+        line = format_task_line(t.task_id, t.task, t.from_name, t.due_str, t.status, is_common=(sheet == COMMON_SHEET))
+        await message.answer(line, reply_markup=admin_task_actions_keyboard(sheet, t.task_id, t.status))
+
+
+# ---------- ADMIN: edit / delete / status callbacks (no confirms) ----------
 
 @router.callback_query(F.data.startswith("admin_toggle:"))
 async def cb_admin_toggle(callback: CallbackQuery):
-    """
-    Админ: переключить статус задачи TODO/DONE.
-    callback_data: admin_toggle:<sheet>:<task_id>:TODO|DONE
-    """
     if await deny_cb_if_not_allowed(callback):
         return
     if not is_admin(callback.from_user.id):
@@ -1019,10 +823,6 @@ async def cb_admin_toggle(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_delete:"))
 async def cb_admin_delete(callback: CallbackQuery):
-    """
-    Админ: удалить задачу.
-    callback_data: admin_delete:<sheet>:<task_id>
-    """
     if await deny_cb_if_not_allowed(callback):
         return
     if not is_admin(callback.from_user.id):
@@ -1043,10 +843,6 @@ async def cb_admin_delete(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_edit_text:"))
 async def cb_admin_edit_text(callback: CallbackQuery, state: FSMContext):
-    """
-    Админ: начать редактирование текста задачи.
-    callback_data: admin_edit_text:<sheet>:<task_id>
-    """
     if await deny_cb_if_not_allowed(callback):
         return
     if not is_admin(callback.from_user.id):
@@ -1065,9 +861,6 @@ async def cb_admin_edit_text(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminTasksFSM.editing_text)
 async def admin_edit_text_enter(message: Message, state: FSMContext):
-    """
-    Админ прислал новый текст -> обновляем Task.
-    """
     if await deny_if_not_allowed(message):
         return
     if await deny_if_not_admin(message):
@@ -1083,7 +876,7 @@ async def admin_edit_text_enter(message: Message, state: FSMContext):
     task_id = data.get("edit_task_id")
 
     if not sheet or not task_id:
-        await send_with_menu(message, "Ошибка состояния редактирования. Открой 🛠 Админ: задачи заново.")
+        await send_with_menu(message, "Ошибка состояния редактирования. Нажми 🛠 Админ: задачи заново.")
         await state.clear()
         return
 
@@ -1093,16 +886,11 @@ async def admin_edit_text_enter(message: Message, state: FSMContext):
     else:
         await send_with_menu(message, "Не нашёл задачу (возможно удалили или изменили ID).")
 
-    # возвращаемся в админ-режим выбора (чтобы можно было продолжить)
     await state.set_state(AdminTasksFSM.choosing_view)
 
 
 @router.callback_query(F.data.startswith("admin_edit_due:"))
 async def cb_admin_edit_due(callback: CallbackQuery, state: FSMContext):
-    """
-    Админ: начать редактирование срока задачи.
-    callback_data: admin_edit_due:<sheet>:<task_id>
-    """
     if await deny_cb_if_not_allowed(callback):
         return
     if not is_admin(callback.from_user.id):
@@ -1123,9 +911,6 @@ async def cb_admin_edit_due(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminTasksFSM.editing_due)
 async def admin_edit_due_enter(message: Message, state: FSMContext):
-    """
-    Админ прислал новую дату -> обновляем Due.
-    """
     if await deny_if_not_allowed(message):
         return
     if await deny_if_not_admin(message):
@@ -1143,7 +928,7 @@ async def admin_edit_due_enter(message: Message, state: FSMContext):
     task_id = data.get("edit_task_id")
 
     if not sheet or not task_id:
-        await send_with_menu(message, "Ошибка состояния редактирования. Открой 🛠 Админ: задачи заново.")
+        await send_with_menu(message, "Ошибка состояния редактирования. Нажми 🛠 Админ: задачи заново.")
         await state.clear()
         return
 
@@ -1156,7 +941,8 @@ async def admin_edit_due_enter(message: Message, state: FSMContext):
     await state.set_state(AdminTasksFSM.choosing_view)
 
 
-#ЧЕПУХА
+# ---------- "ЧЕПУХА": любое некомандное сообщение показывает меню ----------
+
 MENU_BUTTONS = {
     "➕ Новая задача",
     "📋 Мои задачи",
@@ -1173,9 +959,10 @@ async def catch_any_text_show_menu(message: Message):
     text = (message.text or "").strip()
     if text.startswith("/"):
         return
-    if text in MENU_BUTTONS or text.startswith("🛠"):
+    if text in MENU_BUTTONS:
         return
     await send_with_menu(message, "Не понял 🙂 Выбери действие в меню 👇")
+
 
 def build_dispatcher() -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())

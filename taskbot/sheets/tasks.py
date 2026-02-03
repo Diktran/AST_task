@@ -1,31 +1,29 @@
 # tasks.py — работа с задачами в листах (личные + "Общие")
-# ВАЖНО:
-# - TaskID теперь порядковый номер (1,2,3...) через лист Meta
-# - task_append(...) возвращает назначенный task_id
-# - есть функции для админ-редактирования/удаления
+# - TaskID порядковый (через Meta)
+# - CRUD: update text/due, set status, delete
+# - monthly archive: DONE задачам, у которых due < cutoff, ставим ARCHIVE
 
 from __future__ import annotations
 
-from dataclasses import dataclass  # структура задачи
-from typing import List, Optional  # типы
-from datetime import datetime  # время
+from dataclasses import dataclass
+from typing import List, Optional
+from datetime import datetime
 
-import gspread  # исключения/поиск
+import gspread
 
-from taskbot.sheets.schema import ensure_worksheet_exists, ensure_headers  # листы/заголовки
-from taskbot.sheets.client import gs_to_thread  # async вызов
-from taskbot.config import TASK_HEADERS, STATUS_TODO, STATUS_DONE  # константы
+from taskbot.sheets.schema import ensure_worksheet_exists, ensure_headers
+from taskbot.sheets.client import gs_to_thread
+from taskbot.config import TASK_HEADERS, STATUS_TODO, STATUS_DONE, STATUS_ARCHIVE
 
 
-# ---- служебный лист для счётчика ----
-META_SHEET = "Meta"                 # имя листа
-META_HEADERS = ["Key", "Value"]     # заголовки
-TASK_SEQ_KEY = "TASK_SEQ"           # ключ для порядкового номера
+# ---- Meta sheet for sequence ----
+META_SHEET = "Meta"
+META_HEADERS = ["Key", "Value"]
+TASK_SEQ_KEY = "TASK_SEQ"
 
 
 @dataclass
 class TaskRow:
-    """Одна строка задачи."""
     task_id: str
     task: str
     from_name: str
@@ -35,21 +33,16 @@ class TaskRow:
 
 
 def now_iso() -> str:
-    """UTC время в ISO."""
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-# ---------------- META helpers (порядковый номер) ----------------
-
 def _meta_ws_sync():
-    """Получаем лист Meta и гарантируем заголовки."""
     ws = ensure_worksheet_exists(META_SHEET)
     ensure_headers(ws, META_HEADERS)
     return ws
 
 
 def _meta_get_value_sync(ws, key: str) -> Optional[str]:
-    """Читаем значение по ключу из Meta."""
     values = ws.get_all_values()
     for row in values[1:]:
         if len(row) >= 2 and row[0].strip() == key:
@@ -58,9 +51,8 @@ def _meta_get_value_sync(ws, key: str) -> Optional[str]:
 
 
 def _meta_set_value_sync(ws, key: str, value: str) -> None:
-    """Записываем значение по ключу в Meta (update если ключ существует, иначе append)."""
     values = ws.get_all_values()
-    for idx, row in enumerate(values[1:], start=2):  # start=2 потому что 1 строка — заголовки
+    for idx, row in enumerate(values[1:], start=2):
         if len(row) >= 1 and row[0].strip() == key:
             ws.update(f"A{idx}:B{idx}", [[key, value]])
             return
@@ -68,39 +60,24 @@ def _meta_set_value_sync(ws, key: str, value: str) -> None:
 
 
 def next_task_id_sync() -> str:
-    """
-    Возвращаем следующий TaskID как строку числа:
-    - читаем TASK_SEQ
-    - увеличиваем на 1
-    - сохраняем обратно
-    """
     ws = _meta_ws_sync()
     current = _meta_get_value_sync(ws, TASK_SEQ_KEY)
-
     try:
         cur_int = int(current) if current else 0
     except ValueError:
         cur_int = 0
-
     new_val = cur_int + 1
     _meta_set_value_sync(ws, TASK_SEQ_KEY, str(new_val))
     return str(new_val)
 
 
-# ---------------- Tasks helpers ----------------
-
 def _tasks_ws_sync(sheet_name: str):
-    """Получаем лист задач и гарантируем заголовки."""
     ws = ensure_worksheet_exists(sheet_name)
     ensure_headers(ws, TASK_HEADERS)
     return ws
 
 
 def _find_row_by_task_id_sync(ws, task_id: str) -> Optional[int]:
-    """
-    Ищем строку по task_id.
-    Возвращаем индекс строки в Google Sheets (>=2), либо None.
-    """
     try:
         cell = ws.find(task_id)
         return cell.row
@@ -108,14 +85,9 @@ def _find_row_by_task_id_sync(ws, task_id: str) -> Optional[int]:
         return None
 
 
-# ---------------- CRUD (sync) ----------------
+# ---------------- CRUD sync ----------------
 
 def task_append_sync(sheet_name: str, row: TaskRow) -> str:
-    """
-    Синхронно добавляем задачу.
-    Если task_id пустой -> назначаем порядковый.
-    Возвращаем фактический task_id.
-    """
     ws = _tasks_ws_sync(sheet_name)
 
     task_id = (row.task_id or "").strip()
@@ -130,7 +102,6 @@ def task_append_sync(sheet_name: str, row: TaskRow) -> str:
 
 
 def tasks_list_sync(sheet_name: str) -> List[TaskRow]:
-    """Синхронно читаем все задачи из листа."""
     ws = _tasks_ws_sync(sheet_name)
 
     values = ws.get_all_values()
@@ -158,66 +129,88 @@ def tasks_list_sync(sheet_name: str) -> List[TaskRow]:
 
 
 def task_set_status_sync(sheet_name: str, task_id: str, status: str) -> bool:
-    """Синхронно ставим статус TODO/DONE по task_id."""
     ws = _tasks_ws_sync(sheet_name)
     row_idx = _find_row_by_task_id_sync(ws, task_id)
     if row_idx is None:
         return False
-
     status_col_idx = TASK_HEADERS.index("Status") + 1
     ws.update_cell(row_idx, status_col_idx, status)
     return True
 
 
 def task_set_done_sync(sheet_name: str, task_id: str) -> bool:
-    """DONE."""
     return task_set_status_sync(sheet_name, task_id, STATUS_DONE)
 
 
 def task_set_todo_sync(sheet_name: str, task_id: str) -> bool:
-    """TODO."""
     return task_set_status_sync(sheet_name, task_id, STATUS_TODO)
 
 
 def task_update_text_sync(sheet_name: str, task_id: str, new_text: str) -> bool:
-    """Обновляем текст задачи (колонка Task)."""
     ws = _tasks_ws_sync(sheet_name)
     row_idx = _find_row_by_task_id_sync(ws, task_id)
     if row_idx is None:
         return False
-
     task_col_idx = TASK_HEADERS.index("Task") + 1
     ws.update_cell(row_idx, task_col_idx, new_text)
     return True
 
 
 def task_update_due_sync(sheet_name: str, task_id: str, new_due_iso: str) -> bool:
-    """Обновляем срок (колонка Due)."""
     ws = _tasks_ws_sync(sheet_name)
     row_idx = _find_row_by_task_id_sync(ws, task_id)
     if row_idx is None:
         return False
-
     due_col_idx = TASK_HEADERS.index("Due") + 1
     ws.update_cell(row_idx, due_col_idx, new_due_iso)
     return True
 
 
 def task_delete_sync(sheet_name: str, task_id: str) -> bool:
-    """Удаляем строку задачи по task_id."""
     ws = _tasks_ws_sync(sheet_name)
     row_idx = _find_row_by_task_id_sync(ws, task_id)
     if row_idx is None:
         return False
-
     ws.delete_rows(row_idx)
     return True
+
+
+# ---------------- ARCHIVE sync ----------------
+
+def tasks_archive_done_before_sync(sheet_name: str, cutoff_iso: str) -> int:
+    """
+    Помечаем ARCHIVE все задачи со статусом DONE, у которых due < cutoff_iso.
+    cutoff_iso = 'YYYY-MM-01' (первое число текущего месяца)
+    """
+    ws = _tasks_ws_sync(sheet_name)
+
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        return 0
+
+    status_col_idx = TASK_HEADERS.index("Status") + 1
+    due_col_idx = TASK_HEADERS.index("Due") + 1
+
+    archived = 0
+
+    for row_idx in range(2, len(values) + 1):
+        row = values[row_idx - 1]
+        while len(row) < len(TASK_HEADERS):
+            row.append("")
+
+        due_iso = (row[due_col_idx - 1] or "").strip()
+        status = (row[status_col_idx - 1] or "").strip()
+
+        if status == STATUS_DONE and due_iso and due_iso < cutoff_iso:
+            ws.update_cell(row_idx, status_col_idx, STATUS_ARCHIVE)
+            archived += 1
+
+    return archived
 
 
 # ---------------- async wrappers ----------------
 
 async def task_append(sheet_name: str, row: TaskRow) -> str:
-    """Async append, возвращает task_id."""
     return await gs_to_thread(task_append_sync, sheet_name, row)
 
 
@@ -247,3 +240,7 @@ async def task_update_due(sheet_name: str, task_id: str, new_due_iso: str) -> bo
 
 async def task_delete(sheet_name: str, task_id: str) -> bool:
     return await gs_to_thread(task_delete_sync, sheet_name, task_id)
+
+
+async def tasks_archive_done_before(sheet_name: str, cutoff_iso: str) -> int:
+    return await gs_to_thread(tasks_archive_done_before_sync, sheet_name, cutoff_iso)

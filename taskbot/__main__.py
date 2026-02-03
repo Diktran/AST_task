@@ -1,27 +1,34 @@
-# __main__.py позволяет запускать проект командой:
-# python -m taskbot
+# __main__.py — точка входа
+# python -m taskbot         -> запускает бота
+# python -m taskbot archive -> запускает архивирование один раз и выходит
 
-import asyncio  # для запуска async main()
+import sys
+import asyncio
 
-from taskbot.tg.handlers import build_dispatcher  # сборка роутеров/хендлеров
-from taskbot.config import BOT_TOKEN  # токен из конфигурации
-from aiogram import Bot  # объект Telegram-бота
+from aiogram import Bot
+from aiogram.fsm.storage.memory import MemoryStorage
 
-from taskbot.sheets.schema import ensure_base_structure  # создание структуры в Sheets
+from taskbot.config import BOT_TOKEN
+from taskbot.tg.handlers import build_dispatcher
+from taskbot.sheets.archiver import run_monthly_archive_once
 
 
-async def main() -> None:
-    # Создаём объект бота с токеном
+async def _run_bot():
     bot = Bot(token=BOT_TOKEN)
-
-    # На старте гарантируем структуру Google Sheets (Users/Общие/CommonProgress)
-    await ensure_base_structure()
-
-    # Собираем dispatcher и запускаем polling
     dp = build_dispatcher()
     await dp.start_polling(bot)
 
 
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "archive":
+        async def _run():
+            total = await run_monthly_archive_once()
+            print(f"Archived: {total}")
+        asyncio.run(_run())
+        return
+
+    asyncio.run(_run_bot())
+
+
 if __name__ == "__main__":
-    # Запускаем async программу
-    asyncio.run(main())
+    main()
