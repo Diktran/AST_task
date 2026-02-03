@@ -49,11 +49,26 @@ def normalize_due_date(raw: str) -> str:
 
 
 
-def is_overdue(due_iso: str) -> bool:
+def is_overdue(due_str: str) -> bool:
     """
-    Просрочено ли: due < сегодня
+    Проверяем просрочку.
+    Поддерживает:
+    - YYYY-MM-DD
+    - YYYY-MM-DD HH:MM
     """
-    return date.fromisoformat(due_iso) < date.today()
+    if not due_str:
+        return False
+
+    try:
+        if " " in due_str:
+            due_dt = datetime.strptime(due_str, "%Y-%m-%d %H:%M")
+        else:
+            due_dt = datetime.strptime(due_str, "%Y-%m-%d")
+    except ValueError:
+        return False
+
+    return due_dt < datetime.now()
+
 
 
 def today_iso() -> str:
