@@ -33,6 +33,13 @@ GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "ser
 SPREADSHEET_ID: str = os.getenv("SPREADSHEET_ID", "").strip()
 SERVICE_ACCOUNT_PATH: str = os.getenv("SERVICE_ACCOUNT_PATH", "").strip()
 
+DATABASE_URL: str = os.getenv("DATABASE_URL", "").strip()
+
+if not DATABASE_URL:
+    print("WARNING: DATABASE_URL is empty (check .env)")
+
+
+
 # Алиасы для совместимости
 if not SPREADSHEET_ID and GOOGLE_SPREADSHEET_ID:
     SPREADSHEET_ID = GOOGLE_SPREADSHEET_ID
@@ -73,3 +80,5 @@ if not SPREADSHEET_ID:
     print("WARNING: SPREADSHEET_ID/GOOGLE_SPREADSHEET_ID is empty (check .env)")
 if not SERVICE_ACCOUNT_PATH:
     print("WARNING: SERVICE_ACCOUNT_PATH/GOOGLE_SERVICE_ACCOUNT_JSON is empty (check .env)")
+
+
